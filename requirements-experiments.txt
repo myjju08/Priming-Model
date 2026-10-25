@@ -1,0 +1,11 @@
+# Install a GPU-compatible torch/torchvision build first; keep the existing CUDA stack.
+datasets>=3.2
+omegaconf>=2.3
+einops>=0.8
+scipy>=1.14
+timm>=1.0
+huggingface_hub>=0.28
+msgpack>=1.1
+wandb>=0.19
+gdown>=5.2
+PyYAML>=6.0

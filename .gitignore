@@ -1,0 +1,40 @@
+# Python and development caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+.DS_Store
+
+# Local credentials
+.env
+.env.*
+!.env.example
+
+# Large assets and generated state
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.arrow
+/assets/
+/data/*
+!/data/*.py
+/outputs/
+/runs/
+/wandb/
+*.log
+*.out
+*.tmp
+*.lock
+/condaenv.*.requirements.txt
+/checkpoints/
+/recipes/
+*.partial
+*.bin
+*.npy
+*.npz
