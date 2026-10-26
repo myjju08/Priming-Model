@@ -14,9 +14,13 @@ from utils.files import sha256
 from utils.posttrain_assets import verify_file, verify_references
 
 ROOT = Path(__file__).resolve().parents[2]
-STACKS = {'convnext_supcon_tuned': 'supcon', 'convnext_spark_pretrained': 'spark'}
+STACKS = {'convnext_supcon_tuned': 'supcon', 'convnext_spark_pretrained': 'spark',
+          'convnext_supervised_rn50': 'supervised'}
 SPARK_URL = 'https://drive.google.com/uc?id=1H8605HbxGvrsu4x4rIoNr-Wkd7JkxFPQ'
 SPARK_SHA256 = 'ada57a3bd57b72a0d75fd5cbb02469bc688de3ed02b9ecd77dc781ed274fbc3d'
+# Explicit V1 weights avoid torchvision's DEFAULT alias (currently V2).
+SUPERVISED_URL = 'https://download.pytorch.org/models/resnet50-0676ba61.pth'
+SUPERVISED_SHA256 = '0676ba61b6795bbe1773cffd859882e5e297624d384b6993f7c9e683e722fb8a'
 
 
 def source_identity():
@@ -48,7 +52,7 @@ class RN50ConvNext(nn.Module):
     def __init__(self, cache, *, family, device='cuda', microbatch=8):
         super().__init__()
         if family not in STACKS.values() or microbatch < 1:
-            raise ValueError('Expected supcon/spark and a positive microbatch')
+            raise ValueError('Expected supcon/spark/supervised and a positive microbatch')
         self.family = family
         self.family_names = (family, 'convnext')
         cache = Path(cache)
@@ -70,7 +74,7 @@ class RN50ConvNext(nn.Module):
             std = x.new_tensor([.229, .224, .225])[None, :, None, None]
             x = (x-mean)/std
             rows = {}
-            # Same RGB256 input, no crop; identical stage features for both RN50 arms.
+            # Same RGB256 input, no crop; identical stage features for all RN50 arms.
             with torch.autocast(images.device.type, dtype=torch.bfloat16, enabled=images.is_cuda):
                 x = self.backbone.maxpool(self.backbone.relu(self.backbone.bn1(self.backbone.conv1(x))))
                 for i, stage in enumerate((self.backbone.layer1, self.backbone.layer2,

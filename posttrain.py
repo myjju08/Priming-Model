@@ -8,6 +8,7 @@ from pathlib import Path
 import time
 
 from utils.paths import ROOT, configure_environment, resolve as resolve_path
+from utils.experiments import ENCODERS
 
 resolve = partial(resolve_path, canonical=True)
 LOG = logging.getLogger(__name__)
@@ -88,7 +89,7 @@ def load_config(path):
         rope_2d=True, learned_pe=True, P_mean=.8, P_std=.8, perceptual_threshold=.8)
     if any(model.get(key) != value for key, value in fixed_model.items()):
         raise ValueError('Post-training model differs from the B/L production architecture')
-    custom = config.get('experiment', {}).get('profile') in {'b160_mae640_32_40epochs','b160_supcon_tuned_32_40epochs','b160_spark_32_40epochs'}
+    custom = config.get('experiment', {}).get('profile') in {'b160_mae640_32_40epochs','b160_supcon_tuned_32_40epochs','b160_spark_32_40epochs','b160_supervised_32_40epochs'}
     comparison = config.get('experiment', {}).get('profile') == 'encoder_comparison'
     if comparison:
         from utils.experiments import validate_schedule
@@ -113,7 +114,7 @@ def load_config(path):
         raise ValueError('Post-training class populations, calibration, or Sinkhorn settings differ')
     if matching['kind'] not in {'featurewise_ot', 'featurewise_energy', 'featurewise_laplacian_mmd'}:
         raise ValueError('Unsupported feature discrepancy')
-    if matching['stack'] not in {'convnext_full_mae', 'convnext_supcon_tuned', 'convnext_spark_pretrained', 'sim'} or (matching['stack'] == 'sim' and matching['kind'] != 'featurewise_ot'):
+    if matching['stack'] not in {*ENCODERS.values(), 'sim'} or (matching['stack'] == 'sim' and matching['kind'] != 'featurewise_ot'):
         raise ValueError('SIM uses featurewise OT; energy/Laplacian use the full feature stack')
     for key in ('mae_bf16_channels_last', 'compile_encoders', 'sinkhorn_cuda_graph'):
         if not isinstance(matching.get(key, False), bool):
@@ -344,7 +345,7 @@ def train(config, args, output, hf_home, torch_home):
             samples=matching['samples_per_class'], references=matching['real_references_per_class'],
             epsilon_mixture=matching['epsilon_mixture'], iterations=matching['num_iterations'], tolerance=matching['tolerance'])
         reference = RealImages(config['data']['encoder_cache'], config['data']['data_path'], workers=config['data']['reference_workers'])
-        if matching['stack'] in {'convnext_full_mae','convnext_supcon_tuned','convnext_spark_pretrained'}:
+        if matching['stack'] in ENCODERS.values():
             reference.validate_calibration(matcher.encoder.calibration)
         stream = ClasswiseOTStream(class_counts=reference.class_counts, rank=rank, world_size=world, device='cuda',
             seed=matching['seed'], global_classes_per_step=matching['global_classes_per_step'],

@@ -5,7 +5,7 @@ from utils.config import load_yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 ENCODERS = {'mae640': 'convnext_full_mae', 'supcon': 'convnext_supcon_tuned',
-            'spark': 'convnext_spark_pretrained'}
+            'spark': 'convnext_spark_pretrained', 'supervised': 'convnext_supervised_rn50'}
 
 
 def positive(value):

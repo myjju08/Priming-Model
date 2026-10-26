@@ -5,6 +5,38 @@ import tempfile
 from pathlib import Path
 
 
+def resolve_checkpoint(cache, encoder, checkpoint=None, expected_sha=None):
+    """Download and verify the input weights before conversion or calibration."""
+    from models.encoders.rn50 import (SPARK_URL, SPARK_SHA256,
+                                       SUPERVISED_URL, SUPERVISED_SHA256)
+    from utils.files import sha256
+    cache = Path(cache)
+    if encoder == 'supervised':
+        expected_sha = expected_sha or SUPERVISED_SHA256
+    if checkpoint is None:
+        if encoder == 'supcon':
+            raise ValueError('SupCon requires --encoder-checkpoint /path/to/backbone.pth')
+        if encoder == 'supervised':
+            from torch.hub import download_url_to_file
+            checkpoint = cache/'resnet50-0676ba61.pth'
+            if not checkpoint.exists():
+                download_url_to_file(SUPERVISED_URL, str(checkpoint),
+                                     hash_prefix=SUPERVISED_SHA256, progress=True)
+        elif encoder == 'spark':
+            import gdown
+            checkpoint = cache/'spark_official.pth'
+            if not checkpoint.exists():
+                gdown.download(SPARK_URL, str(checkpoint), quiet=False)
+            expected_sha = expected_sha or SPARK_SHA256
+        else:
+            raise ValueError(f'Unknown RN50 encoder: {encoder}')
+    checkpoint = Path(checkpoint).expanduser().resolve()
+    identity = sha256(checkpoint)
+    if expected_sha and identity != expected_sha:
+        raise ValueError('Input checkpoint SHA256 mismatch')
+    return checkpoint, identity
+
+
 def median_distance(features, device, block=128):
     import numpy as np
     import torch
@@ -34,14 +66,19 @@ def prepare(storage, encoder, checkpoint=None, expected_sha=None, *, device='cud
     import numpy as np
     import torch
     from datasets import load_from_disk
-    from models.encoders.rn50 import RN50ConvNext, load_backbone, source_identity, SPARK_URL, SPARK_SHA256
+    from models.encoders.rn50 import RN50ConvNext, load_backbone, source_identity, SUPERVISED_SHA256
+    from utils.experiments import ENCODERS
     from utils.files import sha256, write_json
     from utils.posttrain_assets import verify_references, verify_file
     storage = Path(storage)
     base = storage/'assets/ot/representations'
+    if encoder not in ENCODERS:
+        raise ValueError(f'Unknown encoder: {encoder}')
     if encoder == 'mae640':
         verify_references(base, full=True)
         return
+    if encoder == 'supervised':
+        expected_sha = expected_sha or SUPERVISED_SHA256
     cache = storage/'assets/ot'/encoder
     if device != 'cuda':
         raise ValueError('Calibration must use CUDA BF16 to match training precision')
@@ -60,19 +97,8 @@ def prepare(storage, encoder, checkpoint=None, expected_sha=None, *, device='cud
             raise ValueError('Requested checkpoint SHA256 differs')
         print(f'Verified existing {encoder} calibration: {cache}')
         return
-    if checkpoint is None and encoder == 'supcon':
-        raise ValueError('SupCon requires --encoder-checkpoint /path/to/backbone.pth')
     cache.mkdir(parents=True, exist_ok=True)
-    if checkpoint is None:
-        import gdown
-        checkpoint = cache/'spark_official.pth'
-        if not checkpoint.exists():
-            gdown.download(SPARK_URL, str(checkpoint), quiet=False)
-        expected_sha = expected_sha or SPARK_SHA256
-    checkpoint = Path(checkpoint).expanduser().resolve()
-    identity = sha256(checkpoint)
-    if expected_sha and identity != expected_sha:
-        raise ValueError('Input checkpoint SHA256 mismatch')
+    checkpoint, identity = resolve_checkpoint(cache, encoder, checkpoint, expected_sha)
     verify_references(base, full=False)
     records = json.loads((Path(__file__).resolve().parents[1]/'old/releases/posttrain_encoders.json').read_text())['files']
     for name in ('calibration.json', 'convnext_encoder.pt'):

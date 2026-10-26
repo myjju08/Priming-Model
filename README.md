@@ -1,6 +1,6 @@
 # Priming Model: selectable feature encoders
 
-B/16 post-training with **MAE640**, **SupCon-tuned ResNet-50**, or **SparK ResNet-50**. Choose an encoder using the CLI; training code does not need editing. Each variant retains the original ConvNeXt branch.
+B/16 post-training with **MAE640**, **SupCon-tuned ResNet-50**, **SparK ResNet-50**, or **supervised ImageNet-1K ResNet-50**. Choose an encoder using the CLI; training code does not need editing. Each variant retains the original ConvNeXt branch.
 
 Based on [JaeyeonKim01/priming](https://github.com/JaeyeonKim01/priming), commit `9e887928427d68abd0a1222f10574b3f93924cd0`. Original license and vendored notices are retained. See [upstream documentation](UPSTREAM_README.md) for the original paper and pretraining workflows.
 
@@ -28,6 +28,9 @@ python scripts/experiment.py prepare --encoder mae640 --storage /path/to/storage
 # Official SparK weights are downloaded automatically and SHA256 verified:
 python scripts/experiment.py prepare --encoder spark --storage /path/to/storage
 
+# Official torchvision IMAGENET1K_V1 supervised RN50, also SHA256 pinned:
+python scripts/experiment.py prepare --encoder supervised --storage /path/to/storage
+
 # Your tuned SupCon checkpoint must be supplied locally:
 python scripts/experiment.py prepare --encoder supcon --storage /path/to/storage \
   --encoder-checkpoint /path/to/backbone_final.pth
@@ -47,7 +50,9 @@ python scripts/experiment.py train --encoder spark --storage /path/to/storage \
   --wandb-project 'CVPR - Priming Model'
 ```
 
-Replace `spark` with `mae640` or `supcon`. W&B is enabled only when a project is provided; add `--wandb-entity YOUR_TEAM` if needed. Run IDs are generated per fresh run and preserved on resume. Run under your scheduler or process manager for long jobs.
+Replace `spark` with `mae640`, `supcon`, or `supervised`. W&B is enabled only when a project is provided; add `--wandb-entity YOUR_TEAM` if needed. Run IDs are generated per fresh run and preserved on resume. Run under your scheduler or process manager for long jobs.
+
+The `supervised` control uses torchvision `ResNet50_Weights.IMAGENET1K_V1` (`resnet50-0676ba61.pth`, SHA256 `0676ba61b6795bbe1773cffd859882e5e297624d384b6993f7c9e683e722fb8a`). Only the RN50 weights, encoder identity, and corresponding calibration change from SupCon/SparK: the 12 stage features, RGB256 preprocessing without a crop, ConvNeXt branch, populations, optimizer, schedule, and selected evaluation protocol are identical. It does not use torchvision's `DEFAULT` alias. Its independent cache is `assets/ot/supervised`.
 
 Use `--dry-run` to print the full recipe and launch command without accessing GPUs or creating a run directory. Use `--smoke-steps 2` for a short training check with actual assets; use a separate output for smoke checks.
 
