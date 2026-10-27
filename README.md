@@ -40,6 +40,8 @@ Add `--encoder-sha256 EXPECTED_HASH` to pin a custom checkpoint. Raw torchvision
 
 For a fresh storage root, add `--download`. This downloads the pinned ImageNet release, initial checkpoint, and evaluation assets. ImageNet is large; ensure access rights and sufficient disk space. MAE/ConvNeXt source conversion requires a **separate Python 3.11 + torch 2.6 CPU environment** to reproduce release archive hashes; pass `--conversion-python /path/to/conversion-env/bin/python`. This environment needs torchvision, timm, einops, numpy, msgpack, and huggingface_hub. Do not downgrade the GPU training environment. Conversion is skipped when converted encoders already exist. See [asset details](docs/assets.md).
 
+If the SupCon checkpoint is arriving from another server, [managed SupCon preparation](docs/managed-supcon.md) downloads and verifies the dataset and support assets independently, then queues calibration, a smoke check and training once the checkpoint and matching evaluation references are ready.
+
 RN50 preparation recalibrates all 12 features on the same 2,000 training images as the released MAE calibration, using the median distance over all 1,999,000 unordered pairs. It requires a GPU and temporary disk space for FP32 feature arrays. ConvNeXt features, scales and weights are preserved. Cached checkpoint/calibration/source hashes are verified; use `--recalibrate` explicitly after changing the checkpoint or extractor.
 
 ## Run
