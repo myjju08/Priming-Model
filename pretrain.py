@@ -26,8 +26,11 @@ def load_config(path):
     if diffusion and (not isinstance(experiment, dict) or
                       experiment.get("profile") != "diffusion_pretraining"):
         raise ValueError("Unknown pretraining experiment profile")
-    if (train["micro_batch_size"], train["gradient_accumulation_steps"], train["dtype"]) != (64, 2, "bf16"):
-        raise ValueError("Production pretraining uses microbatch 64, accumulation 2, and BF16")
+    batches = {(64, 2)}
+    if diffusion and config["loss"]["aux"]["enabled"] is True:
+        batches.add((32, 4))
+    if train["dtype"] != "bf16" or (train["micro_batch_size"], train["gradient_accumulation_steps"]) not in batches:
+        raise ValueError("Pretraining requires BF16 and microbatch/accumulation 64/2 (or 32/4 for perceptual diffusion)")
     if diffusion:
         if (type(train["epochs"]) is not int or type(train["steps_per_epoch"]) is not int or
                 (train["epochs"], train["steps_per_epoch"]) != (10, 1251)):
@@ -130,6 +133,21 @@ class AuxiliaryStream:
             else:
                 torch.manual_seed(self.call_seed)
             return self.fn(prediction, target, mask)
+
+
+def dummy_batches(config, *, device="cuda", include_indices=False):
+    """Match profiling and DDP warmup allocations to the actual microbatches."""
+    import torch
+    micro = config["train"]["micro_batch_size"]
+    size = config["data"]["img_size"]
+    batches = []
+    for _ in range(config["train"]["gradient_accumulation_steps"]):
+        batch = (torch.zeros(micro, 3, size, size, device=device),
+                 torch.arange(micro, device=device))
+        if include_indices:
+            batch += (torch.zeros(micro, 2, dtype=torch.long),)
+        batches.append(batch)
+    return batches
 
 
 def train_step(config, model, batches, auxiliary, step, *, family, rank, device="cuda"):
@@ -267,8 +285,7 @@ def train(config, family, args, output, hf_home, torch_home):
         if completed == 0 and config["train"]["measure_flops"]:
             from torch.utils.flop_counter import FlopCounterMode
             saved_rng = snapshot_rng()
-            dummy = [(torch.zeros(64, 3, 256, 256, device="cuda"),
-                      torch.arange(64, device="cuda")) for _ in range(2)]
+            dummy = dummy_batches(config)
             with FlopCounterMode(display=False) as counter:
                 train_step(config, model, dummy, auxiliary, 1, family=family, rank=rank)
             optimizer.zero_grad(set_to_none=True)
@@ -294,8 +311,7 @@ def train(config, family, args, output, hf_home, torch_home):
         # B historically warms DDP buckets with two backwards and restores RNG.
         if family == "b":
             saved_rng = snapshot_rng()
-            dummy = [(torch.zeros(64, 3, 256, 256, device="cuda"),
-                      torch.arange(64, device="cuda"), torch.zeros(64, 2, dtype=torch.long)) for _ in range(2)]
+            dummy = dummy_batches(config, include_indices=True)
             for _ in range(2):
                 optimizer.zero_grad(set_to_none=True)
                 train_step(config, training_model, dummy, auxiliary, max(completed, 1), family=family, rank=rank)

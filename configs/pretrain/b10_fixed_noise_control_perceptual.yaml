@@ -22,4 +22,6 @@ loss:
     enabled: true
 train:
   epochs: 10
+  micro_batch_size: 32
+  gradient_accumulation_steps: 4
   milestone_interval: 10

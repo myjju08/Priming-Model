@@ -61,6 +61,69 @@ class DiffusionPretrainTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "every sampled noise level"):
             self.validate(config)
 
+    def test_perceptual_memory_fallback_keeps_global_batch_and_matched_control(self):
+        diffusion = self.config("b10_diffusion_perceptual")
+        control = self.config("b10_fixed_noise_control_perceptual")
+        self.assertEqual((diffusion["train"]["micro_batch_size"],
+                          diffusion["train"]["gradient_accumulation_steps"]), (32, 4))
+        self.assertEqual(8 * 32 * 4, 1024)
+        control["experiment"]["variant"] = "variable_noise"
+        control["model"].update(t_min=0., t_max=1.)
+        self.assertEqual(diffusion, control)
+        for name, micro, accumulation in (("b10_diffusion", 32, 4),
+                ("b160_perceptual", 32, 4), ("b10_diffusion_perceptual", 16, 8),
+                ("b10_diffusion_perceptual", 32, 2)):
+            config = self.config(name)
+            config["train"].update(micro_batch_size=micro, gradient_accumulation_steps=accumulation)
+            with self.subTest(name=name, micro=micro, accumulation=accumulation), self.assertRaises(ValueError):
+                self.validate(config)
+        diffusion["train"].update(micro_batch_size=64, gradient_accumulation_steps=2)
+        self.validate(diffusion)
+        diffusion["train"]["dtype"] = "fp32"
+        with self.assertRaises(ValueError):
+            self.validate(diffusion)
+
+    def test_profiling_and_warmup_batches_use_recipe_shapes(self):
+        for name, micro, accumulation in (("b10_diffusion", 64, 2),
+                                         ("b10_diffusion_perceptual", 32, 4)):
+            config = self.config(name)
+            config["data"]["img_size"] = 4
+            for include_indices in (False, True):
+                batches = pretrain.dummy_batches(config, device="cpu", include_indices=include_indices)
+                self.assertEqual(len(batches), accumulation)
+                for batch in batches:
+                    self.assertEqual(batch[0].shape, (micro, 3, 4, 4))
+                    self.assertEqual(batch[1].shape, (micro,))
+                    self.assertEqual(len(batch), 3 if include_indices else 2)
+                    if include_indices:
+                        self.assertEqual(batch[2].shape, (micro, 2))
+
+    def test_accumulation_four_has_same_average_loss_and_gradient_as_two(self):
+        class ToyModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.scale = nn.Parameter(torch.tensor(.7, dtype=torch.float64))
+
+            def forward(self, images, labels, aux_loss_fn=None):
+                loss = (self.scale * images - labels[:, None, None, None]).square().mean()
+                return loss, {"loss_mse": loss}
+
+        images = torch.linspace(-1., 1., 128 * 12, dtype=torch.float64).reshape(128, 3, 2, 2)
+        labels = (torch.arange(128) % 3).to(torch.float64)
+        reference = ToyModel()
+        expected, _ = reference(images, labels)
+        expected.backward()
+        for micro, accumulation in ((64, 2), (32, 4)):
+            config = self.config()
+            config["train"].update(micro_batch_size=micro, gradient_accumulation_steps=accumulation)
+            model = ToyModel()
+            batches = list(zip(images.split(micro), labels.split(micro)))
+            actual, metrics = pretrain.train_step(config, model, batches, None, 1,
+                                                  family="b", rank=0, device="cpu")
+            torch.testing.assert_close(actual.double(), expected.detach(), atol=1e-6, rtol=1e-6)
+            torch.testing.assert_close(metrics["loss_mse"], expected.detach())
+            torch.testing.assert_close(model.scale.grad, reference.scale.grad, atol=1e-12, rtol=1e-12)
+
     def test_plain_mse_values_gradients_and_no_perceptual_construction(self):
         config = self.config()
         self.assertIsNone(pretrain.build_auxiliary(config, "b", "does-not-exist", device="cpu"))

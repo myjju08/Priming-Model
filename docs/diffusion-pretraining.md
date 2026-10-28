@@ -105,8 +105,13 @@ post-training updates, and 1-NFE generation identical between comparisons.
 ## Ten-epoch training preparation
 
 All recipes use RGB256 ImageNet, 1,251 updates/epoch, 10 epochs = **12,510 updates**,
-8 GPUs, microbatch 64/GPU, accumulation 2, global batch 1,024, BF16, Muon LR 0.001,
-constant schedule, seed 1, and EMA 0.9999. Both comparisons initialize from
+8 GPUs, global batch 1,024, BF16, Muon LR 0.001, constant schedule, seed 1, and
+EMA 0.9999. MSE-only recipes use microbatch 64/GPU and accumulation 2. Perceptual
+recipes use microbatch 32/GPU and accumulation 4 because batch 64 with both
+encoders exceeded RTX 5090 memory. Both profiling and DDP warmup use the configured
+batch size. The effective batch and mean-loss objective remain the same; changing
+microbatch boundaries changes the stateless noise/crop random realizations.
+Both comparisons initialize from
 scratch; the transferred `priming_b_10.pth` is not their initialization.
 
 Validate schema and parameter count without GPUs:

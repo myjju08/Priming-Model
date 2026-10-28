@@ -90,6 +90,10 @@ def validate_diffusion_pretraining_contract(source):
     enabled = auxiliary.get('enabled')
     if not isinstance(enabled, bool) or experiment.get('auxiliary') != ('perceptual' if enabled else 'none'):
         raise ValueError('Diffusion auxiliary loss differs from its declared experiment')
+    batch_pair = (train.get('micro_batch_size'), train.get('gradient_accumulation_steps'))
+    allowed_pairs = {(64, 2), (32, 4)} if enabled else {(64, 2)}
+    if train.get('dtype') != 'bf16' or batch_pair not in allowed_pairs:
+        raise ValueError('Diffusion initialization requires BF16 and global batch 1024 on eight ranks')
     if enabled:
         expected_aux = dict(lpips_weight=.4, convnext_weight=.1, norm_eps=.01,
                             norm_p=1., random_crop=True, crop_scale=[.08, 1.])

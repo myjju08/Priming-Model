@@ -22,4 +22,7 @@ loss:
     enabled: true
 train:
   epochs: 10
+  # Preserve global batch 1024 on eight 32 GiB GPUs with perceptual activations.
+  micro_batch_size: 32
+  gradient_accumulation_steps: 4
   milestone_interval: 10
