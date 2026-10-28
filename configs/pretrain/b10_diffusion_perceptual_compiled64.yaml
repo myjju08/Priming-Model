@@ -1,0 +1,28 @@
+# Compiled batch 64; eager FLOPs profiling is disabled to avoid its memory peak.
+_base_: _base.yaml
+experiment:
+  profile: diffusion_pretraining
+  variant: variable_noise
+  prediction_target: x0
+  noise_schedule: linear
+  loss_weighting: uniform
+  auxiliary: perceptual
+data:
+  random_horizontal_flip: true
+model:
+  timestep_conditioning: true
+  generation_t: 1.0
+  t_dist: uniform
+  t_min: 0.0
+  t_max: 1.0
+loss:
+  norm_p: 0.0
+  perceptual_threshold: 1.0
+  aux:
+    enabled: true
+train:
+  epochs: 10
+  micro_batch_size: 64
+  gradient_accumulation_steps: 2
+  milestone_interval: 10
+  measure_flops: false

@@ -8,7 +8,8 @@ from unittest import mock
 
 from scripts.run_diffusion_pretrain import (command, gpu_blockers, load_plan,
                                            predecessor_blockers, run_plan, post_command,
-                                           wait_for_capacity, QueueStopped, initialization_checkpoint)
+                                           wait_for_capacity, QueueStopped, initialization_checkpoint,
+                                           verify_prevalidated_smoke)
 
 
 class DiffusionLauncherTest(unittest.TestCase):
@@ -151,6 +152,16 @@ class DiffusionLauncherTest(unittest.TestCase):
         self.assertNotIn("--smoke-steps", production)
 
     def test_full_chain_order_and_smoke_tracking_are_isolated(self):
+        self.assert_full_chain(adopt=False)
+
+    def test_adopted_benchmark_skips_only_pretraining_smoke_and_starts_fresh_production(self):
+        self.assert_full_chain(adopt=True)
+
+    def assert_full_chain(self, *, adopt):
+        adopted = dict(adopted=True, completed_updates=25, checkpoint_sha256="0"*64)
+        if adopt:
+            self.plan["prevalidated_pretrain_smoke"] = dict(output=str(self.root / "benchmark"),
+                                                           updates=25, checkpoint_sha256="0"*64)
         cache = self.root / "encoder-cache"
         cache.mkdir()
         for name in ("calibration.json", "encoder_manifest.json", "supervised_encoder.pt"):
@@ -175,21 +186,89 @@ class DiffusionLauncherTest(unittest.TestCase):
                 mock.patch("scripts.run_diffusion_pretrain.source_manifest", return_value={}), \
                 mock.patch("scripts.run_diffusion_pretrain.wait_for_capacity"), \
                 mock.patch("scripts.run_diffusion_pretrain.verify_completed"), \
+                mock.patch("scripts.run_diffusion_pretrain.verify_prevalidated_smoke", return_value=adopted), \
                 mock.patch("scripts.run_diffusion_pretrain.verify_post_completed", side_effect=lambda output,*args:Path(output)/"checkpoint.pth"), \
                 mock.patch("scripts.run_diffusion_pretrain.subprocess.run") as execute:
             run_plan(self.plan, wait=True)
         calls = execute.call_args_list
-        self.assertEqual(len(calls), 5)
-        self.assertIn("--smoke-steps", calls[0].args[0])
-        self.assertNotIn("--smoke-steps", calls[1].args[0])
-        self.assertIn("prepare", calls[2].args[0])
-        self.assertIn("--smoke-steps", calls[3].args[0])
-        self.assertNotIn("--smoke-steps", calls[4].args[0])
+        self.assertEqual(len(calls), 4 if adopt else 5)
+        if not adopt:
+            self.assertIn("--smoke-steps", calls[0].args[0])
+        tail = calls[-4:]
+        self.assertNotIn("--smoke-steps", tail[0].args[0])
+        self.assertNotIn("--resume", tail[0].args[0])
+        self.assertIn("prepare", tail[1].args[0])
+        self.assertIn("--smoke-steps", tail[2].args[0])
+        self.assertNotIn("--smoke-steps", tail[3].args[0])
         self.assertEqual([call.kwargs["env"]["WANDB_MODE"] for call in calls],
-                         ["disabled", "online", "disabled", "disabled", "online"])
+                         (["disabled"] if not adopt else []) + ["online", "disabled", "disabled", "online"])
         status = json.loads((self.root / "status" / (self.plan["name"] + ".json")).read_text())
         self.assertEqual(status["status"], "complete")
         self.assertEqual(status["completed_updates"], 100120)
+
+    def make_prevalidated_smoke(self):
+        import torch
+        from utils.files import sha256
+        output = self.root / "verified-benchmark"
+        directory = output / "checkpoints"
+        directory.mkdir(parents=True)
+        checkpoint = directory / "step_0000025.pth"
+        config = dict(model=dict(timestep_conditioning=True), loss=dict(aux=dict(enabled=True)))
+        manifest = dict(runtime={"pretrain.py":"source-hash"}, assets={"vgg16":"asset-hash"})
+        state = dict(step=25, current_step=26, samples_seen=25*1024, world_size=8,
+                     rank_states=[dict(rank=rank) for rank in range(8)], config=config, manifest=manifest)
+        torch.save(state, checkpoint)
+        (directory / "latest.pth").symlink_to(checkpoint.name)
+        self.write(output / "manifest.json", manifest)
+        self.write(output / "config.json", config)
+        rows = [dict(step=step, loss=.1, grad_norm=.01, update_seconds=1.2) for step in range(1,26)]
+        (output / "metrics.jsonl").write_text("".join(json.dumps(row)+"\n" for row in rows))
+        self.plan["prevalidated_pretrain_smoke"] = dict(output=str(output), updates=25,
+                                                       checkpoint_sha256=sha256(checkpoint))
+        return output, config, manifest
+
+    def test_prevalidated_smoke_requires_exact_config_manifest_and_checksum(self):
+        output, config, manifest = self.make_prevalidated_smoke()
+        with mock.patch("utils.assets.pretraining_manifest", return_value=manifest):
+            report = verify_prevalidated_smoke(self.plan, config)
+            self.assertTrue(report["adopted"])
+            self.assertEqual(report["completed_updates"], 25)
+            changed = copy.deepcopy(config)
+            changed["loss"]["aux"]["enabled"] = False
+            with self.assertRaisesRegex(ValueError, "configuration"):
+                verify_prevalidated_smoke(self.plan, changed)
+        with mock.patch("utils.assets.pretraining_manifest", return_value={"runtime":"changed"}):
+            with self.assertRaisesRegex(ValueError, "source, dataset, or asset"):
+                verify_prevalidated_smoke(self.plan, config)
+        self.plan["prevalidated_pretrain_smoke"]["checkpoint_sha256"] = "0"*64
+        with self.assertRaisesRegex(ValueError, "checksum"):
+            verify_prevalidated_smoke(self.plan, config)
+
+    def test_prevalidated_smoke_rejects_missing_updates_and_nonfinite_metrics(self):
+        output, config, manifest = self.make_prevalidated_smoke()
+        path = output / "metrics.jsonl"
+        rows = path.read_text().splitlines()
+        path.write_text("\n".join(rows[1:])+"\n")
+        with mock.patch("utils.assets.pretraining_manifest", return_value=manifest):
+            with self.assertRaisesRegex(ValueError, "incomplete or nonfinite"):
+                verify_prevalidated_smoke(self.plan, config)
+        bad = json.loads(rows[0])
+        bad["update_seconds"] = float("nan")
+        path.write_text("\n".join([json.dumps(bad), *rows[1:]])+"\n")
+        with mock.patch("utils.assets.pretraining_manifest", return_value=manifest):
+            with self.assertRaisesRegex(ValueError, "incomplete or nonfinite"):
+                verify_prevalidated_smoke(self.plan, config)
+
+    def test_prevalidated_smoke_plan_rejects_unbound_digest_and_reused_output(self):
+        path = self.root / "plan.json"
+        self.plan["prevalidated_pretrain_smoke"] = dict(output=str(self.root / "benchmark"), updates=25)
+        self.write(path, self.plan)
+        with self.assertRaisesRegex(ValueError, "SHA256"):
+            load_plan(path)
+        self.plan["prevalidated_pretrain_smoke"].update(checkpoint_sha256="0"*64, output=self.plan["output"])
+        self.write(path, self.plan)
+        with self.assertRaisesRegex(ValueError, "separate"):
+            load_plan(path)
 
 
 if __name__ == "__main__":

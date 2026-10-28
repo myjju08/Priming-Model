@@ -56,6 +56,21 @@ def load_plan(path):
         digest = post.get("encoder_sha256", "")
         if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
             raise ValueError("posttraining requires the supervised encoder SHA256")
+    if "prevalidated_pretrain_smoke" in plan:
+        smoke = plan["prevalidated_pretrain_smoke"]
+        if not isinstance(smoke, dict) or not isinstance(smoke.get("output"), str) or not smoke["output"].strip():
+            raise ValueError("Prevalidated smoke requires its separate output directory")
+        smoke["output"] = str(Path(smoke["output"]).expanduser().resolve())
+        if type(smoke.get("updates")) is not int or smoke["updates"] < 2:
+            raise ValueError("Prevalidated smoke requires at least two completed updates")
+        digest = smoke.get("checkpoint_sha256", "")
+        if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            raise ValueError("Prevalidated smoke requires an exact checkpoint SHA256")
+        targets = [plan["output"], plan["smoke_output"]]
+        if "posttraining" in plan:
+            targets += [plan["posttraining"][key] for key in ("output", "smoke_output")]
+        if smoke["output"] in targets:
+            raise ValueError("Prevalidated smoke must be separate from all fresh run outputs")
     return plan
 
 
@@ -163,7 +178,7 @@ def source_manifest(plan, config):
 
 
 def check(plan):
-    config, _ = resolved_configs(plan)
+    config, smoke = resolved_configs(plan)
     if not Path(plan["python"]).is_file():
         raise FileNotFoundError(plan["python"])
     manifest = source_manifest(plan, config)
@@ -184,12 +199,14 @@ def check(plan):
         fatal.append("Insufficient free disk space for both training phases")
     if stop_requested(plan):
         fatal.append("STOP_REQUESTED is present")
+    adopted_smoke = verify_prevalidated_smoke(plan, smoke) if "prevalidated_pretrain_smoke" in plan else None
     blockers += fatal
     return dict(ready=not blockers, blockers=blockers, config_valid=True,
                 fatal_blockers=fatal,
                 asset_manifest=manifest, production_updates=config["train"]["epochs"]
                 * config["train"]["steps_per_epoch"], posttraining_updates=100120 if "posttraining" in plan else None,
-                smoke_updates=2, launched=False)
+                smoke_updates=adopted_smoke["completed_updates"] if adopted_smoke else 2,
+                prevalidated_smoke=adopted_smoke, launched=False)
 
 
 def command(plan, config_path, *, smoke=False):
@@ -217,6 +234,39 @@ def verify_completed(output, expected, expected_config):
     last = json.loads((output / "metrics.jsonl").read_text().splitlines()[-1])
     if last.get("step") != expected or not all(math.isfinite(last[k]) for k in ("loss", "grad_norm")):
         raise ValueError("Pretraining did not finish with finite loss and gradients")
+
+
+def verify_prevalidated_smoke(plan, expected_config):
+    """Reuse GPU validation only; production still starts from random weights.
+
+    Match the exact untracked configuration and checkpoint's pretraining source,
+    data, and asset manifest. This excludes this orchestration script because the
+    standalone benchmark and production both execute the same pretrain.py stack.
+    """
+    import torch
+    from utils.assets import pretraining_manifest
+    selected = plan["prevalidated_pretrain_smoke"]
+    output, updates = Path(selected["output"]), selected["updates"]
+    checkpoint = output / "checkpoints/latest.pth"
+    if not checkpoint.is_file() or sha256(checkpoint) != selected["checkpoint_sha256"]:
+        raise ValueError("Prevalidated smoke checkpoint checksum differs or is missing")
+    verify_completed(output, updates, expected_config)
+    state = torch.load(checkpoint, map_location="cpu", mmap=True, weights_only=False)
+    manifest = pretraining_manifest(expected_config, root=ROOT, family="b", hf_home=plan["hf_home"],
+                                    torch_home=plan["torch_home"], lpips_weights=plan["lpips_weights"])
+    if state.get("manifest") != manifest or json.loads((output / "manifest.json").read_text()) != manifest:
+        raise ValueError("Prevalidated smoke source, dataset, or asset identity differs")
+    if json.loads((output / "config.json").read_text()) != expected_config or expected_config.get("tracking"):
+        raise ValueError("Prevalidated smoke must have the exact configuration without tracking")
+    rows = [json.loads(line) for line in (output / "metrics.jsonl").read_text().splitlines() if line]
+    if ([row.get("step") for row in rows] != list(range(1, updates+1))
+            or not all(math.isfinite(row[key]) for row in rows for key in ("loss", "grad_norm", "update_seconds"))
+            or any(row["update_seconds"] <= 0 for row in rows)):
+        raise ValueError("Prevalidated smoke metrics are incomplete or nonfinite")
+    return dict(adopted=True, output=str(output), completed_updates=updates,
+                checkpoint=str(checkpoint.resolve()), checkpoint_sha256=selected["checkpoint_sha256"],
+                configuration_and_manifest_verified=True,
+                production_initialization="from_scratch; smoke weights and optimizer are not inherited")
 
 
 def post_command(plan, config_path, *, smoke=False):
@@ -352,6 +402,11 @@ def run_plan(plan, *, wait=False):
             for stage, config, expected in (("smoke", smoke, 2),
                                            ("production", production, report["production_updates"])):
                 ready()
+                if stage == "smoke" and "prevalidated_pretrain_smoke" in plan:
+                    adopted = verify_prevalidated_smoke(plan, smoke)
+                    preserve(runtime / "smoke-complete.json", dict(stage=stage, **adopted))
+                    record("smoke_adopted", prevalidated_smoke=adopted)
+                    continue
                 record("running")
                 stage_env = dict(environment, WANDB_MODE="disabled" if stage == "smoke" else "online")
                 subprocess.run(command(plan, paths[stage], smoke=stage == "smoke"),

@@ -106,9 +106,17 @@ post-training updates, and 1-NFE generation identical between comparisons.
 
 All recipes use RGB256 ImageNet, 1,251 updates/epoch, 10 epochs = **12,510 updates**,
 8 GPUs, global batch 1,024, BF16, Muon LR 0.001, constant schedule, seed 1, and
-EMA 0.9999. MSE-only recipes use microbatch 64/GPU and accumulation 2. Perceptual
-recipes use microbatch 32/GPU and accumulation 4 because batch 64 with both
-encoders exceeded RTX 5090 memory. Both profiling and DDP warmup use the configured
+EMA 0.9999. MSE-only recipes use microbatch 64/GPU and accumulation 2. The standard
+perceptual recipes use microbatch 32/GPU and accumulation 4, which also fits the
+initial **eager FLOPs diagnostic** on RTX 5090. That diagnostic's memory failure
+at batch 64 does not establish the memory requirement of compiled training.
+
+The `b10_diffusion_perceptual_compiled64.yaml` and matched
+`b10_fixed_noise_control_perceptual_compiled64.yaml` recipes use microbatch 64,
+accumulation 2, and `measure_flops=false`. They retain compilation and every
+scientific loss setting. Use `PYTORCH_ALLOC_CONF=expandable_segments:True` and
+validate full compiled forward/backward plus optimizer updates on the target
+machine before selecting them. Both profiling and DDP warmup honor the configured
 batch size. The effective batch and mean-loss objective remain the same; changing
 microbatch boundaries changes the stateless noise/crop random realizations.
 Both comparisons initialize from
@@ -146,6 +154,13 @@ identities at the boundaries. Failed or partial runs require explicit recovery;
 they are not automatically repeated. Use supervisor for the long-running chain.
 The storage or runtime `STOP_REQUESTED` marker cancels waiting/prevents the next
 stage; the storage marker also requests a checkpointed stop during training.
+
+A plan can explicitly adopt a completed 25-update benchmark as its pretraining
+smoke test using `prevalidated_pretrain_smoke`. The launcher checks checkpoint
+SHA256, exact smoke configuration, source/data/asset manifest, counters, and finite
+metrics before skipping that one smoke launch. Production still initializes from
+scratch, and the post-training smoke test is retained. This avoids recompiling an
+already validated setup solely to repeat two updates.
 
 The production plan logs to W&B project `CVPR - Priming Model` with a separate
 run ID. Tracking includes pixel MSE, optional auxiliary losses, mean sampled
