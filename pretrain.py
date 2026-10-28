@@ -21,14 +21,59 @@ def load_config(path):
     if family is None:
         raise ValueError("Pretraining supports OST_B and OST_L")
     train, optimizer, model = config["train"], config["optimizer"], config["model"]
+    experiment = config.get("experiment")
+    diffusion = "experiment" in config
+    if diffusion and (not isinstance(experiment, dict) or
+                      experiment.get("profile") != "diffusion_pretraining"):
+        raise ValueError("Unknown pretraining experiment profile")
     if (train["micro_batch_size"], train["gradient_accumulation_steps"], train["dtype"]) != (64, 2, "bf16"):
         raise ValueError("Production pretraining uses microbatch 64, accumulation 2, and BF16")
-    if train["steps_per_epoch"] != 1251 or train["epochs"] != 160:
+    if diffusion:
+        if (type(train["epochs"]) is not int or type(train["steps_per_epoch"]) is not int or
+                (train["epochs"], train["steps_per_epoch"]) != (10, 1251)):
+            raise ValueError("Diffusion comparison requires 10 epochs of 1251 updates")
+        objective = dict(prediction_target="x0", noise_schedule="linear", loss_weighting="uniform")
+        if any(experiment.get(key) != value for key, value in objective.items()):
+            raise ValueError("Supported diffusion objective is linear-path x0 prediction with w(t)=1")
+        variant = experiment.get("variant")
+        intervals = {"variable_noise": (0., 1.), "fixed_noise_control": (.8, .8)}
+        if variant not in intervals or (model["t_min"], model["t_max"]) != intervals[variant]:
+            raise ValueError("Noise interval does not match the declared diffusion/control variant")
+        expected = dict(model="OST_B", patch_size=16, token_channels=3,
+                        tokenizer_patch_size=1, class_tokens=8, guidance_tokens=0,
+                        interval_tokens=0, label_drop_prob=0., corruption="denoising",
+                        t_dist="uniform", noise_scale=1., rope_2d=True, learned_pe=True,
+                        timestep_conditioning=True, generation_t=1.)
+        if any(model.get(key) != value for key, value in expected.items()):
+            raise ValueError("Diffusion comparison requires time-conditioned B/16 and generation_t=1")
+        if model["timestep_conditioning"] is not True or isinstance(model["generation_t"], bool):
+            raise ValueError("Time conditioning must be boolean true and generation_t must be numeric")
+        if model.get("input_space") not in (None, "pixel") or (
+                config["data"]["img_size"], config["data"]["num_classes"]) != (256, 1000):
+            raise ValueError("Diffusion comparison requires ImageNet RGB256")
+        if config["loss"]["norm_p"] != 0 or config["loss"]["norm_eps"] != 1e-4:
+            raise ValueError("w(t)=1 requires plain MSE (norm_p=0), not residual-dependent adaptive weighting")
+        auxiliary = config["loss"]["aux"]
+        if not isinstance(auxiliary["enabled"], bool):
+            raise ValueError("Auxiliary enabled must be boolean")
+        if auxiliary["enabled"]:
+            if config["loss"]["perceptual_threshold"] != 1.:
+                raise ValueError("Optional perceptual supervision must cover every sampled noise level")
+            expected_aux = dict(lpips_weight=.4, convnext_weight=.1, norm_eps=.01,
+                                norm_p=1., random_crop=True, crop_scale=[.08, 1.])
+            if any(auxiliary.get(key) != value for key, value in expected_aux.items()):
+                raise ValueError("Optional perceptual supervision retains the original weights and preprocessing")
+        if experiment.get("auxiliary") != ("perceptual" if auxiliary["enabled"] else "none"):
+            raise ValueError("Experiment auxiliary label disagrees with the actual loss")
+    elif train["steps_per_epoch"] != 1251 or train["epochs"] != 160:
         raise ValueError("Production recipes use 1251 updates/epoch for 160 epochs")
     if optimizer["optimizer"] != "muon" or optimizer["lr_sched"] != "constant" or optimizer["warmup_epochs"] != 0:
         raise ValueError("Production reconstruction uses Muon with constant LR and no warmup")
-    if model["label_drop_prob"] != 0 or model["t_dist"] != "uniform" or (model["t_min"], model["t_max"]) != (.8, .8):
+    if not diffusion and (model["label_drop_prob"] != 0 or model["t_dist"] != "uniform" or
+                          (model["t_min"], model["t_max"]) != (.8, .8)):
         raise ValueError("Production reconstruction uses fixed t=0.8 and no label dropout")
+    if not diffusion and model.get("timestep_conditioning", False):
+        raise ValueError("Time conditioning requires an explicit diffusion experiment profile")
     if family == "l" and not config["loss"]["aux"]["enabled"]:
         raise ValueError("There is no packaged L no-perceptual recipe")
     if train["ema_rates"] != [.9999] or train["ema_type"] != "const":
@@ -125,6 +170,22 @@ def train_step(config, model, batches, auxiliary, step, *, family, rank, device=
     return total, metrics
 
 
+def rank_zero_action(action, rank):
+    """Propagate setup/diagnostic/tracking failures instead of stranding other ranks."""
+    import torch.distributed as dist
+    status = [None]
+    result = None
+    if rank == 0:
+        try:
+            result = action()
+        except Exception as exc:
+            status[0] = repr(exc)
+    dist.broadcast_object_list(status, src=0)
+    if status[0] is not None:
+        raise RuntimeError(status[0])
+    return result
+
+
 def train(config, family, args, output, hf_home, torch_home):
     import torch
     import torch.distributed as dist
@@ -138,6 +199,9 @@ def train(config, family, args, output, hf_home, torch_home):
     from utils.random import mixed_seed, seed_all, snapshot_rng, restore_rng
 
     rank, world = initialize()
+    tracking_run = None
+    diffusion = config.get("experiment", {}).get("profile") == "diffusion_pretraining"
+    from utils.pretrain_tracking import start_tracking, log_update, log_panels
     try:
         torch.set_num_threads(4 if family == "b" else int(os.environ.get("OMP_NUM_THREADS", "8")))
         torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = True
@@ -167,6 +231,8 @@ def train(config, family, args, output, hf_home, torch_home):
         dist.barrier()
         logging.basicConfig(level=logging.INFO if rank == 0 else logging.WARNING,
                             format="%(asctime)s %(message)s")
+        if not args.smoke_steps:
+            tracking_run = rank_zero_action(lambda: start_tracking(config, output, resume=bool(args.resume)), rank)
         seed_all(config["train"]["seed"] + rank)
         dataset = build_dataset({**config["data"], "seed": config["train"]["seed"]}, family)
         if len(dataset) != 1281167:
@@ -211,7 +277,7 @@ def train(config, family, args, output, hf_home, torch_home):
             dist.all_reduce(flops)
             if rank == 0:
                 (output / "training_flops.json").write_text(json.dumps(dict(
-                    global_step_flops=flops.item(), planned_updates=200160,
+                    global_step_flops=flops.item(), planned_updates=config["train"]["epochs"]*config["train"]["steps_per_epoch"],
                     scope="Supported forward/backward operations; excludes optimizer/EMA/communication"), indent=2) + "\n")
             del dummy
         if config["train"]["compile"]:
@@ -240,15 +306,24 @@ def train(config, family, args, output, hf_home, torch_home):
         if family == "b":
             from data.imagenet import BImages
             from utils.visualization import pretraining_panels
-            if rank == 0:
+            from utils.diffusion_diagnostics import diffusion_panels
+
+            def diagnostic(step):
+                if diffusion:
+                    report, path = diffusion_panels(output, step, model, ema, validation_rows)
+                    log_panels(tracking_run, report, path, config["train"]["steps_per_epoch"])
+                else:
+                    pretraining_panels(output, step, model, ema, validation_rows)
+
+            def initial_diagnostic():
                 validation = BImages(Path(config["data"]["data_path"]) / "imagenet-latents-images/val", hflip=False)
                 if len(validation) != 50000:
                     raise ValueError("Expected 50,000 validation images")
                 for i in range(0, 50000, 6250):
                     image, label, _ = validation[(0, i)]
                     validation_rows.append((image, label))
-                pretraining_panels(output, completed, model, ema, validation_rows)
-            dist.barrier()
+                diagnostic(completed)
+            rank_zero_action(initial_diagnostic, rank)
         train_cfg = config["train"]
         epoch_steps = train_cfg["steps_per_epoch"]
         target = min(epoch_steps * train_cfg["epochs"], args.smoke_steps or epoch_steps * train_cfg["epochs"])
@@ -266,6 +341,8 @@ def train(config, family, args, output, hf_home, torch_home):
                     next(iterator)
             while completed < min((epoch + 1) * epoch_steps, target):
                 step = completed + 1
+                step_started = time.perf_counter()
+                row = None
                 loss, metrics = train_step(config, training_model, [next(iterator) for _ in range(accumulation)],
                     auxiliary, step, family=family, rank=rank)
                 norm = grad_norm(model.parameters())
@@ -288,23 +365,29 @@ def train(config, family, args, output, hf_home, torch_home):
                 values /= world
                 if rank == 0:
                     row = dict(step=step, loss=values[0].item(), grad_norm=values[1].item(),
+                               update_seconds=time.perf_counter()-step_started,
                                **{name: value.item() for name, value in zip(metrics, values[2:])})
                     with (output / "metrics.jsonl").open("a") as handle:
                         handle.write(json.dumps(row) + "\n")
                     if step <= 2 or step % train_cfg["print_freq"] == 0:
                         LOG.info("step=%d/%d loss=%.6f", step, target, row["loss"])
+                if config.get("tracking") and (step <= 2 or step % train_cfg["print_freq"] == 0 or step % epoch_steps == 0 or step == target):
+                    rank_zero_action(lambda: log_update(tracking_run, row, epoch_steps), rank)
                 stop = stopping("cuda")
                 if stop or step == target or step % epoch_steps == 0:
                     save_pretraining(output, step, model, optimizer, ema, config, manifest, family=family,
                                      elapsed=elapsed + time.perf_counter() - start, loader_generator=loader_generator)
-                if family == "b" and (step == target or step % (20 * epoch_steps) == 0):
-                    if rank == 0:
-                        pretraining_panels(output, step, model, ema, validation_rows)
-                    dist.barrier()
+                if family == "b" and (step == target or step % ((1 if diffusion else 20) * epoch_steps) == 0):
+                    rank_zero_action(lambda: diagnostic(step), rank)
                 if stop:
                     return 75
         return 0
     finally:
+        if tracking_run is not None:
+            try:
+                tracking_run.finish()
+            except Exception:
+                LOG.exception("W&B finish failed")
         dist.destroy_process_group()
 
 

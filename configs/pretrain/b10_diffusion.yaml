@@ -1,0 +1,26 @@
+_base_: _base.yaml
+experiment:
+  profile: diffusion_pretraining
+  variant: variable_noise
+  prediction_target: x0
+  noise_schedule: linear
+  loss_weighting: uniform
+  auxiliary: none
+data:
+  random_horizontal_flip: true
+model:
+  # x_t = (1-t)*x0 + t*epsilon; one independent t per image.
+  timestep_conditioning: true
+  generation_t: 1.0
+  t_dist: uniform
+  t_min: 0.0
+  t_max: 1.0
+loss:
+  # Plain x0 MSE, w(t)=1. The original residual-adaptive loss is disabled.
+  norm_p: 0.0
+  perceptual_threshold: 1.0
+  aux:
+    enabled: false
+train:
+  epochs: 10
+  milestone_interval: 10

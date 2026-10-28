@@ -55,6 +55,8 @@ def save_pretraining(output, step, model, optimizer, ema, config, manifest,
                                              world_size=world, global_batch=global_batch,
                                              model=config["model"], data=config["data"], loss=config["loss"],
                                              optimizer=config["optimizer"], train=config["train"]))
+                if config.get("experiment", {}).get("profile") == "diffusion_pretraining":
+                    payload["contract"]["experiment"] = dict(config["experiment"])
             path = directory / f"step_{step:07d}.pth"
             temporary = path.with_suffix(".pth.tmp")
             torch.save(payload, temporary)

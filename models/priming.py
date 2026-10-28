@@ -94,7 +94,7 @@ class FinalLayer(nn.Module):
 
 
 class OST(nn.Module):
-    """One-Step Transformer with optional CFG/interval conditioning, but no timestep conditioning."""
+    """One-Step Transformer with optional CFG, interval, and noise-level conditioning."""
 
     def __init__(
         self,
@@ -115,6 +115,8 @@ class OST(nn.Module):
         weight_init_constant: float = 0.32,
         rope_2d: bool = True,
         learned_pe: bool = True,
+        timestep_conditioning: bool = False,
+        generation_t: float = 1.0,
     ):
         super().__init__()
         self.input_size = input_size
@@ -129,6 +131,14 @@ class OST(nn.Module):
         self.num_class_tokens = num_class_tokens
         self.num_cfg_tokens = num_cfg_tokens
         self.num_interval_tokens = num_interval_tokens
+        if not isinstance(timestep_conditioning, bool):
+            raise ValueError("timestep_conditioning must be a boolean")
+        self.timestep_conditioning = timestep_conditioning
+        self.generation_t = float(generation_t)
+        if not 0. <= self.generation_t <= 1.:
+            raise ValueError("generation_t must be a noise fraction in [0, 1]")
+        if timestep_conditioning and num_class_tokens < 1:
+            raise ValueError("Noise-level conditioning requires at least one class token")
 
         if num_cfg_tokens < 0 or num_interval_tokens < 0:
             raise ValueError("num_cfg_tokens and num_interval_tokens must be non-negative")
@@ -157,6 +167,8 @@ class OST(nn.Module):
             init_constant=embedding_init_constant,
         )
         self.y_embedder = LabelEmbedder(num_classes, **embed_kwargs)
+        if timestep_conditioning:
+            self.noise_t_embedder = TimestepEmbedder(**embed_kwargs)
         if num_cfg_tokens > 0:
             self.omega_embedder = TimestepEmbedder(**embed_kwargs)
         if num_interval_tokens > 0:
@@ -214,9 +226,29 @@ class OST(nn.Module):
         x = torch.einsum("nhwpqc->nchpwq", x)
         return x.reshape((x.shape[0], c, h * p, w * p))
 
-    def _build_sequence(self, x, y, omega=None, t_min=None, t_max=None):
+    def _noise_embedding(self, noise_t, x):
+        # Noise fraction t uses the original interpolation convention:
+        # z_t = (1-t)*image + t*noise. Scale it for sinusoidal time features.
+        # Calls without an explicit noise level are one-step generation calls.
+        if noise_t is None:
+            noise_t = torch.full((x.shape[0],), self.generation_t, device=x.device)
+        else:
+            noise_t = torch.as_tensor(noise_t, device=x.device, dtype=torch.float32)
+            if noise_t.ndim == 0:
+                noise_t = noise_t.expand(x.shape[0])
+            else:
+                noise_t = noise_t.reshape(-1)
+            if noise_t.shape != (x.shape[0],):
+                raise ValueError("noise_t must contain one noise fraction per image")
+        return self.noise_t_embedder(noise_t * 1000.)
+
+    def _build_sequence(self, x, y, omega=None, t_min=None, t_max=None, noise_t=None):
         x_embed = self.x_embedder(x)
         y_embed = self.y_embedder(y)
+        if self.timestep_conditioning:
+            y_embed = y_embed + self._noise_embedding(noise_t, x)
+        elif noise_t is not None:
+            raise ValueError("noise_t requires timestep_conditioning=True")
         sequence_parts = [self.class_tokens + y_embed.unsqueeze(1)]
 
         if self.num_cfg_tokens > 0:
@@ -238,8 +270,8 @@ class OST(nn.Module):
         sequence_parts.append(x_embed)
         return self.pos_embed_func(torch.cat(sequence_parts, dim=1))
 
-    def forward(self, x, y, omega=None, t_min=None, t_max=None):
-        seq = self._build_sequence(x, y, omega=omega, t_min=t_min, t_max=t_max)
+    def forward(self, x, y, omega=None, t_min=None, t_max=None, noise_t=None):
+        seq = self._build_sequence(x, y, omega=omega, t_min=t_min, t_max=t_max, noise_t=noise_t)
         for block in self.blocks:
             seq = block(seq, self.rope_freqs)
         patches = self.final_layer(seq[:, self.prefix_tokens:])
@@ -287,6 +319,8 @@ class Priming(nn.Module):
         rope_2d=True,
         learned_pe=True,
         corruption="denoising",
+        timestep_conditioning=False,
+        generation_t=1.0,
     ):
         super().__init__()
         self.img_size = img_size
@@ -307,6 +341,8 @@ class Priming(nn.Module):
         self.norm_eps = norm_eps
         self.norm_p = norm_p
         self.perceptual_threshold = perceptual_threshold
+        self.timestep_conditioning = timestep_conditioning
+        self.generation_t = float(generation_t)
         self.input_space = input_space or (
             "pixel" if tokenizer_patch_size == 1 and in_channels == 3 else "latent"
         )
@@ -334,6 +370,8 @@ class Priming(nn.Module):
             weight_init_constant=weight_init_constant,
             rope_2d=rope_2d,
             learned_pe=learned_pe,
+            timestep_conditioning=timestep_conditioning,
+            generation_t=generation_t,
         )
 
         n_params = sum(p.numel() for p in self.parameters() if p.requires_grad) / 1e6
@@ -442,22 +480,29 @@ class Priming(nn.Module):
             })
         return kwargs
 
-    def _forward_generator(self, z, y, cfg=1.0, t_min=0.0, t_max=1.0):
+    def _forward_generator(self, z, y, cfg=1.0, t_min=0.0, t_max=1.0, noise_t=None):
         if self.label_drop_prob >= 1.0:
             y = torch.full_like(y, self.num_classes)
+        kwargs = self._cfg_kwargs(z.shape[0], z.device, z.dtype, cfg=cfg, t_min=t_min, t_max=t_max)
+        if noise_t is not None:
+            kwargs["noise_t"] = noise_t
         return self.net(
             z,
             y,
-            **self._cfg_kwargs(z.shape[0], z.device, z.dtype, cfg=cfg, t_min=t_min, t_max=t_max),
+            **kwargs,
         )
 
-    def x_fn(self, z_t, omega, y):
+    def x_fn(self, z_t, omega, y, noise_t=None):
         bz = z_t.shape[0]
         z_double = torch.cat([z_t, z_t], dim=0)
         y_null = torch.full((bz,), self.num_classes, device=y.device, dtype=y.dtype)
         y_double = torch.cat([y, y_null], dim=0)
         omega_double = torch.cat([omega, torch.ones_like(omega)], dim=0)
         cfg_kwargs = {"omega": omega_double}
+        if self.timestep_conditioning:
+            if noise_t is None:
+                raise ValueError("Conditioned guidance requires the sampled noise level")
+            cfg_kwargs["noise_t"] = torch.cat([noise_t.reshape(-1), noise_t.reshape(-1)])
         if self.net.num_interval_tokens > 0:
             cfg_kwargs.update({
                 "t_min": torch.zeros_like(omega_double),
@@ -473,7 +518,10 @@ class Priming(nn.Module):
             torch.ones_like(omega),
         )
         with torch.no_grad():
-            x_c, x_u = self.x_fn(z_t, omega, y)
+            if self.timestep_conditioning:
+                x_c, x_u = self.x_fn(z_t, omega, y, noise_t=t)
+            else:
+                x_c, x_u = self.x_fn(z_t, omega, y)
             guidance = (1 - 1 / omega).view(-1, 1, 1, 1)
             x_target = x + guidance * (x_c - x_u)
         return x_target.detach()
@@ -496,6 +544,7 @@ class Priming(nn.Module):
         t = self.sample_t(x.shape[0], x.device, x.dtype)
         e = torch.randn_like(x) * self.noise_scale
         z_t = self.corrupt_inputs(x, t, e)
+        time_kwargs = {"noise_t": t.reshape(-1)} if self.timestep_conditioning else {}
 
         if self.net.num_cfg_tokens > 0:
             omega = self.sample_cfg_scale(x.shape[0], x.device, x.dtype)
@@ -503,16 +552,21 @@ class Priming(nn.Module):
             x_target = self.guidance_fn(x, z_t, t, y, omega, t_min, t_max)
             if drop_mask is not None:
                 x_target = torch.where(drop_mask.view(-1, 1, 1, 1), x, x_target)
-            x_pred = self.net(z_t, labels, omega=omega, t_min=t_min, t_max=t_max)
+            x_pred = self.net(z_t, labels, omega=omega, t_min=t_min, t_max=t_max, **time_kwargs)
         else:
             x_target = x
-            x_pred = self.net(z_t, labels)
+            x_pred = self.net(z_t, labels, **time_kwargs)
 
-        return reconstruction_loss(
+        loss, metrics = reconstruction_loss(
             x_pred, x_target, norm_eps=self.norm_eps, norm_p=self.norm_p,
             aux_loss_fn=aux_loss_fn if self.training else None, aux_target=x,
             times=t, perceptual_threshold=self.perceptual_threshold,
         )
+        if self.timestep_conditioning:
+            metrics["noise_t_mean"] = t.mean()
+            if self.training and aux_loss_fn is not None:
+                metrics["perceptual_active_fraction"] = (t <= self.perceptual_threshold).float().mean()
+        return loss, metrics
 
     def sample_images_with_grad(self, x, y, sampling_args=None):
         if sampling_args is None:
@@ -520,7 +574,8 @@ class Priming(nn.Module):
         cfg = sampling_args.get("cfg", 1.0)
         t_min = sampling_args.get("t_min", 0.0)
         t_max = sampling_args.get("t_max", 1.0)
-        return self._forward_generator(x, y, cfg=cfg, t_min=t_min, t_max=t_max)
+        return self._forward_generator(x, y, cfg=cfg, t_min=t_min, t_max=t_max,
+                                       noise_t=sampling_args.get("noise_t"))
 
     @torch.inference_mode()
     def generate(self, n_samples, labels, cfg=4.0, args=None, verbose=True, z_t=None):
@@ -540,5 +595,6 @@ class Priming(nn.Module):
 
         t_min = getattr(args, "interval_min", 0.0) if args is not None else 0.0
         t_max = getattr(args, "interval_max", 1.0) if args is not None else 1.0
-        return self._forward_generator(z_t, labels, cfg=cfg, t_min=t_min, t_max=t_max)
+        noise_t = getattr(args, "noise_t", None) if args is not None else None
+        return self._forward_generator(z_t, labels, cfg=cfg, t_min=t_min, t_max=t_max, noise_t=noise_t)
 

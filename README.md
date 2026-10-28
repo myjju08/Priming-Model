@@ -4,6 +4,8 @@ B/16 post-training with **MAE640**, **SupCon-tuned ResNet-50**, **SparK ResNet-5
 
 Based on [JaeyeonKim01/priming](https://github.com/JaeyeonKim01/priming), commit `9e887928427d68abd0a1222f10574b3f93924cd0`. Original license and vendored notices are retained. See [upstream documentation](UPSTREAM_README.md) for the original paper and pretraining workflows.
 
+The [ten-epoch diffusion pretraining experiment](docs/diffusion-pretraining.md) adds optional noise-level conditioning, sampled-noise clean-image MSE, and matched fixed-noise controls. Its checkpoint retains the timestep module for subsequent pure-noise, 1-NFE OT post-training.
+
 ## Setup
 
 Use Python 3.11+ and a working CUDA-enabled PyTorch/torchvision installation compatible with your GPU. RTX 50-series requires CUDA 12.8 or newer wheels. Keep the installed GPU stack; `requirements-experiments.txt` deliberately does not replace PyTorch.

@@ -89,6 +89,11 @@ def load_config(path):
         rope_2d=True, learned_pe=True, P_mean=.8, P_std=.8, perceptual_threshold=.8)
     if any(model.get(key) != value for key, value in fixed_model.items()):
         raise ValueError('Post-training model differs from the B/L production architecture')
+    if not isinstance(model.get('timestep_conditioning', False), bool):
+        raise ValueError('model.timestep_conditioning must be true or false')
+    generation_t = model.get('generation_t', 1.)
+    if isinstance(generation_t, bool) or not isinstance(generation_t, (int, float)) or generation_t != 1.:
+        raise ValueError('Post-training generates from pure noise and requires model.generation_t=1')
     custom = config.get('experiment', {}).get('profile') in {'b160_mae640_32_40epochs','b160_supcon_tuned_32_40epochs','b160_spark_32_40epochs','b160_supervised_32_40epochs'}
     comparison = config.get('experiment', {}).get('profile') == 'encoder_comparison'
     if comparison:
@@ -153,6 +158,20 @@ def make_model(config, device='cuda'):
     kwargs = dict(config['model'])
     kwargs['backbone'] = kwargs.pop('model')
     return Priming(**kwargs, num_classes=config['data']['num_classes']).to(device)
+
+
+def validate_pretraining_timestep_contract(config, path):
+    """Reject mismatched noise conditioning before allocating training models.
+
+    Legacy checkpoints/configs omit the flag and mean False. Time conditioning
+    changes trainable tensors; it must be requested explicitly on both sides.
+    Full tensor names/shapes, EMA, and optimizer contracts remain checked by
+    initialize_posttraining/load_weights; this never drops or initializes keys.
+    """
+    import torch
+    from utils.posttrain_checkpoint import validate_timestep_contract
+    source = torch.load(path, map_location='cpu', mmap=True, weights_only=False)
+    validate_timestep_contract(source, config)
 
 
 def run_training(config, model, optimizer, ema, matcher, reference, stream, output, *,
@@ -308,6 +327,9 @@ def train(config, args, output, hf_home, torch_home):
         message = [None]
         if rank == 0:
             try:
+                if not args.resume:
+                    initialization = resolve(args.init_checkpoint) if args.init_checkpoint else config['initialization']['checkpoint']
+                    validate_pretraining_timestep_contract(config, initialization)
                 weights = {name: str(path) for name, path in evaluation_assets(config['evaluation'],
                     hf_home=hf_home, torch_home=torch_home).items()}
                 message[0] = dict(config=prepare_run(config, args, output), weights=weights)

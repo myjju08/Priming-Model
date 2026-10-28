@@ -1,0 +1,25 @@
+# Optional output perceptual supervision on directly predicted x0.
+_base_: _base.yaml
+experiment:
+  profile: diffusion_pretraining
+  variant: fixed_noise_control
+  prediction_target: x0
+  noise_schedule: linear
+  loss_weighting: uniform
+  auxiliary: perceptual
+data:
+  random_horizontal_flip: true
+model:
+  timestep_conditioning: true
+  generation_t: 1.0
+  t_dist: uniform
+  t_min: 0.8
+  t_max: 0.8
+loss:
+  norm_p: 0.0
+  perceptual_threshold: 1.0
+  aux:
+    enabled: true
+train:
+  epochs: 10
+  milestone_interval: 10
