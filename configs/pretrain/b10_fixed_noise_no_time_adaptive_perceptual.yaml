@@ -1,0 +1,32 @@
+# Matched control: same original architecture/loss, with fixed input corruption t=0.8.
+_base_: _base.yaml
+experiment:
+  profile: diffusion_pretraining
+  variant: fixed_noise_control
+  conditioning: none
+  prediction_target: x0
+  noise_schedule: linear
+  loss_weighting: adaptive_residual
+  auxiliary: perceptual
+data:
+  random_horizontal_flip: true
+model:
+  class_tokens: 8
+  timestep_conditioning: false
+  log_noise_metrics: true
+  generation_t: 1.0
+  t_dist: uniform
+  t_min: 0.8
+  t_max: 0.8
+loss:
+  norm_eps: 0.0001
+  norm_p: 1.0
+  perceptual_threshold: 1.0
+  aux:
+    enabled: true
+train:
+  epochs: 10
+  micro_batch_size: 64
+  gradient_accumulation_steps: 2
+  measure_flops: false
+  milestone_interval: 10

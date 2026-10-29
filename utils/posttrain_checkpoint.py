@@ -45,7 +45,7 @@ def validate_timestep_contract(source, config):
 
 
 def validate_diffusion_pretraining_contract(source):
-    """Recognize only the explicit x0/linear/uniform 10-epoch diffusion profile.
+    """Recognize explicit x0/linear 10-epoch diffusion weighting contracts.
 
     This is the sole exception to the legacy perceptual-pretraining requirement.
     The scientific recipe is duplicated in config and contract intentionally;
@@ -62,13 +62,19 @@ def validate_diffusion_pretraining_contract(source):
     if (not isinstance(experiment, dict) or experiment != configured_experiment
             or experiment.get('profile') != 'diffusion_pretraining'):
         raise ValueError('Diffusion experiment must agree in checkpoint config and contract')
-    required = dict(prediction_target='x0', noise_schedule='linear', loss_weighting='uniform')
+    required = dict(prediction_target='x0', noise_schedule='linear')
     if any(experiment.get(key) != value for key, value in required.items()):
-        raise ValueError('Diffusion initialization requires linear-path x0 prediction with uniform loss weighting')
+        raise ValueError('Diffusion initialization requires linear-path x0 prediction')
+    weighting = experiment.get('loss_weighting')
+    pixel_powers = {'uniform': 0., 'adaptive_residual': 1.}
+    if not isinstance(weighting, str) or weighting not in pixel_powers:
+        raise ValueError('Diffusion loss_weighting must be uniform or adaptive_residual')
     conditioning = experiment.get('conditioning', 'timestep')
     if not isinstance(conditioning, str) or conditioning not in {'timestep', 'none'}:
         raise ValueError('Diffusion conditioning must be timestep or explicitly none')
     time_conditioned = conditioning == 'timestep'
+    if weighting == 'adaptive_residual' and conditioning != 'none':
+        raise ValueError('Adaptive-residual initialization requires explicitly unconditioned original Priming')
     for section in ('model', 'data', 'loss', 'train', 'optimizer'):
         if not isinstance(contract.get(section), dict) or contract[section] != saved_config.get(section):
             raise ValueError(f'Diffusion checkpoint config and contract differ: {section}')
@@ -94,12 +100,15 @@ def validate_diffusion_pretraining_contract(source):
         raise ValueError('Diffusion initialization requires the 10-epoch, 1251-update recipe')
     if type(source.get('step')) is not int or not 0 <= source['step'] <= train['epochs'] * train['steps_per_epoch']:
         raise ValueError('Diffusion checkpoint step is outside its training horizon')
-    if loss.get('norm_p') != 0 or loss.get('norm_eps') != 1e-4:
-        raise ValueError('Diffusion initialization requires plain x0 MSE, norm_p=0')
+    if (isinstance(loss.get('norm_p'), bool) or loss.get('norm_p') != pixel_powers[weighting]
+            or loss.get('norm_eps') != 1e-4):
+        raise ValueError('Pixel norm_p must match declared loss_weighting (uniform=0, adaptive_residual=1), with norm_eps=1e-4')
     auxiliary = loss.get('aux', {})
     enabled = auxiliary.get('enabled')
     if not isinstance(enabled, bool) or experiment.get('auxiliary') != ('perceptual' if enabled else 'none'):
         raise ValueError('Diffusion auxiliary loss differs from its declared experiment')
+    if weighting == 'adaptive_residual' and enabled is not True:
+        raise ValueError('Adaptive-residual initialization retains the original perceptual losses')
     batch_pair = (train.get('micro_batch_size'), train.get('gradient_accumulation_steps'))
     allowed_pairs = {(64, 2), (32, 4)} if enabled else {(64, 2)}
     if train.get('dtype') != 'bf16' or batch_pair not in allowed_pairs:

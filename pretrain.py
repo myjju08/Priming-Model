@@ -39,13 +39,19 @@ def load_config(path):
         if (type(train["epochs"]) is not int or type(train["steps_per_epoch"]) is not int or
                 (train["epochs"], train["steps_per_epoch"]) != (10, 1251)):
             raise ValueError("Diffusion comparison requires 10 epochs of 1251 updates")
-        objective = dict(prediction_target="x0", noise_schedule="linear", loss_weighting="uniform")
+        objective = dict(prediction_target="x0", noise_schedule="linear")
         if any(experiment.get(key) != value for key, value in objective.items()):
-            raise ValueError("Supported diffusion objective is linear-path x0 prediction with w(t)=1")
+            raise ValueError("Supported diffusion objective is linear-path x0 prediction")
+        weighting = experiment.get("loss_weighting")
+        pixel_powers = {"uniform": 0., "adaptive_residual": 1.}
+        if not isinstance(weighting, str) or weighting not in pixel_powers:
+            raise ValueError("Diffusion loss_weighting must be uniform or adaptive_residual")
         conditioning = experiment.get("conditioning", "timestep")
         if not isinstance(conditioning, str) or conditioning not in {"timestep", "none"}:
             raise ValueError("Diffusion conditioning must be timestep or explicitly none")
         time_conditioned = conditioning == "timestep"
+        if weighting == "adaptive_residual" and conditioning != "none":
+            raise ValueError("Adaptive-residual comparison requires explicitly unconditioned original Priming")
         variant = experiment.get("variant")
         intervals = {"variable_noise": (0., 1.), "fixed_noise_control": (.8, .8)}
         if variant not in intervals or (model["t_min"], model["t_max"]) != intervals[variant]:
@@ -62,11 +68,15 @@ def load_config(path):
         if model.get("input_space") not in (None, "pixel") or (
                 config["data"]["img_size"], config["data"]["num_classes"]) != (256, 1000):
             raise ValueError("Diffusion comparison requires ImageNet RGB256")
-        if config["loss"]["norm_p"] != 0 or config["loss"]["norm_eps"] != 1e-4:
-            raise ValueError("w(t)=1 requires plain MSE (norm_p=0), not residual-dependent adaptive weighting")
+        if (isinstance(config["loss"]["norm_p"], bool)
+                or config["loss"]["norm_p"] != pixel_powers[weighting]
+                or config["loss"]["norm_eps"] != 1e-4):
+            raise ValueError("Pixel norm_p must match declared loss_weighting (uniform=0, adaptive_residual=1), with norm_eps=1e-4")
         auxiliary = config["loss"]["aux"]
         if not isinstance(auxiliary["enabled"], bool):
             raise ValueError("Auxiliary enabled must be boolean")
+        if weighting == "adaptive_residual" and auxiliary["enabled"] is not True:
+            raise ValueError("Adaptive-residual comparison retains the original perceptual losses")
         if auxiliary["enabled"]:
             if config["loss"]["perceptual_threshold"] != 1.:
                 raise ValueError("Optional perceptual supervision must cover every sampled noise level")
