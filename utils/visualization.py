@@ -24,8 +24,14 @@ def pretraining_panels(output, step, model, ema, rows):
         for label in ("online", ema.label):
             swap = ema.swap(model) if label != "online" else nullcontext()
             with swap, torch.autocast("cuda", dtype=torch.bfloat16):
-                denoised = model.net(.2 * images + .8 * noise, labels).float()
-                generated = model.net(noise, labels).float()
+                if getattr(model, 'timestep_conditioned', False):
+                    denoised = model.net(.2 * images + .8 * noise, labels,
+                        t=torch.full((len(images),), .8, device=images.device)).float()
+                    generated = model.net(noise, labels,
+                        t=torch.ones(len(images), device=images.device)).float()
+                else:
+                    denoised = model.net(.2 * images + .8 * noise, labels).float()
+                    generated = model.net(noise, labels).float()
             if not torch.isfinite(denoised).all() or not torch.isfinite(generated).all():
                 raise FloatingPointError("Nonfinite diagnostic images")
             report[label + "_mse"] = (denoised - images).square().mean().item()

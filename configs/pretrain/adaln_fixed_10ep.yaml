@@ -1,0 +1,15 @@
+_base_: _base.yaml
+data:
+  random_horizontal_flip: true
+model:
+  model: OST_B_ADALN
+  t_dist: uniform
+  t_min: 0.8
+  t_max: 0.8
+train:
+  epochs: 10
+  # Only the eager FLOPs diagnostic is omitted; optimization is unchanged.
+  measure_flops: false
+experiment:
+  profile: adaln_timestep_pretraining
+  arm: fixed

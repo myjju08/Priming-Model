@@ -12,22 +12,61 @@ from utils.paths import ROOT, configure_environment, resolve as resolve_path
 
 resolve = partial(resolve_path, canonical=True)
 LOG = logging.getLogger(__name__)
+ADALN_PROFILE = "adaln_timestep_pretraining"
+
+
+def validate_adaln_pretraining(config):
+    """Keep the paired experiment fixed except for its declared timestep range."""
+    experiment = config.get("experiment", {})
+    if experiment.get("profile") != ADALN_PROFILE or experiment.get("arm") not in {"fixed", "uniform"}:
+        raise ValueError("Expected a declared fixed/uniform adaLN pretraining arm")
+    expected_model = dict(model="OST_B_ADALN", patch_size=16, token_channels=3,
+        tokenizer_patch_size=1, class_tokens=8, guidance_tokens=0, interval_tokens=0,
+        label_drop_prob=0., rope_2d=True, learned_pe=True, corruption="denoising",
+        t_dist="uniform", P_mean=.8, P_std=.8, noise_scale=1., cfg_beta=1., cfg_omega_max=7.)
+    bounds = (.8, .8) if experiment["arm"] == "fixed" else (0., 1.)
+    expected_model.update(t_min=bounds[0], t_max=bounds[1])
+    if config["model"] != expected_model:
+        raise ValueError("adaLN model or declared timestep range differs from the paired recipe")
+    expected_loss = dict(norm_eps=1e-4, norm_p=1., perceptual_threshold=.8,
+        aux=dict(enabled=True, lpips_weight=.4, convnext_weight=.1, norm_eps=.01,
+                 norm_p=1., random_crop=True, crop_scale=[.08, 1.]))
+    if config["loss"] != expected_loss:
+        raise ValueError("adaLN comparison preserves the original pixel, LPIPS and ConvNeXt losses")
+    expected_optimizer = dict(optimizer="muon", lr=.001, min_lr=0., lr_sched="constant",
+        warmup_epochs=0, warmup_rate=0., weight_decay=0., beta1=.9, beta2=.95,
+        muon_momentum=.95, muon_weight_decay=0., grad_clip=0.)
+    if config["optimizer"] != expected_optimizer:
+        raise ValueError("adaLN comparison preserves the original Muon optimizer")
+    train = config["train"]
+    fixed_train = dict(epochs=10, steps_per_epoch=1251, micro_batch_size=64,
+        gradient_accumulation_steps=2, seed=1, dtype="bf16", ema_type="const",
+        ema_rates=[.9999], measure_flops=False)
+    if any(train.get(key) != value for key, value in fixed_train.items()):
+        raise ValueError("adaLN pretraining requires ten epochs, batch1024 and the original EMA")
+    data = config["data"]
+    if (data.get("num_classes"), data.get("img_size"), data.get("random_horizontal_flip")) != (1000, 256, True):
+        raise ValueError("adaLN comparison requires the original ImageNet256 augmentation")
+    return experiment["arm"]
 
 
 def load_config(path):
     from utils.config import load_yaml
     config = load_yaml(resolve(path))
-    family = {"OST_B": "b", "OST_L": "l"}.get(config["model"]["model"])
+    ablation = config.get("experiment", {}).get("profile") == ADALN_PROFILE
+    if ablation:
+        validate_adaln_pretraining(config)
+    family = {"OST_B": "b", "OST_L": "l", **({"OST_B_ADALN": "b"} if ablation else {})}.get(config["model"]["model"])
     if family is None:
         raise ValueError("Pretraining supports OST_B and OST_L")
     train, optimizer, model = config["train"], config["optimizer"], config["model"]
     if (train["micro_batch_size"], train["gradient_accumulation_steps"], train["dtype"]) != (64, 2, "bf16"):
         raise ValueError("Production pretraining uses microbatch 64, accumulation 2, and BF16")
-    if train["steps_per_epoch"] != 1251 or train["epochs"] != 160:
+    if train["steps_per_epoch"] != 1251 or train["epochs"] != (10 if ablation else 160):
         raise ValueError("Production recipes use 1251 updates/epoch for 160 epochs")
     if optimizer["optimizer"] != "muon" or optimizer["lr_sched"] != "constant" or optimizer["warmup_epochs"] != 0:
         raise ValueError("Production reconstruction uses Muon with constant LR and no warmup")
-    if model["label_drop_prob"] != 0 or model["t_dist"] != "uniform" or (model["t_min"], model["t_max"]) != (.8, .8):
+    if not ablation and (model["label_drop_prob"] != 0 or model["t_dist"] != "uniform" or (model["t_min"], model["t_max"]) != (.8, .8)):
         raise ValueError("Production reconstruction uses fixed t=0.8 and no label dropout")
     if family == "l" and not config["loss"]["aux"]["enabled"]:
         raise ValueError("There is no packaged L no-perceptual recipe")
@@ -313,18 +352,21 @@ def main():
     parser.add_argument("--config", required=True)
     parser.add_argument("--output", help="Fresh training output directory")
     parser.add_argument("--resume", help="Renewed pretraining checkpoint, or a historical L checkpoint")
-    parser.add_argument("--smoke-steps", type=int, help="Stop a fresh run after this many updates")
+    parser.add_argument("--smoke-steps", type=int,
+                        help="Absolute update cap; resumed runs are supported only by the adaLN experiment")
     parser.add_argument("--data-path", help="Root containing imagenet-latents-images")
     parser.add_argument("--hf-home")
     parser.add_argument("--torch-home")
     parser.add_argument("--lpips-weights", default="assets/lpips/vgg.pth")
     parser.add_argument("--check-config", action="store_true", help="Validate the recipe/model schema without data or GPUs")
     args = parser.parse_args()
-    if args.smoke_steps is not None and (args.smoke_steps < 1 or args.resume):
-        parser.error("--smoke-steps must be positive and requires a fresh run")
+    if args.smoke_steps is not None and args.smoke_steps < 1:
+        parser.error("--smoke-steps must be positive")
     if not args.check_config and not args.output:
         parser.error("--output is required for training")
     config, family = load_config(args.config)
+    if args.smoke_steps is not None and args.resume and config.get("experiment", {}).get("profile") != ADALN_PROFILE:
+        parser.error("--smoke-steps requires a fresh run for released production recipes")
     if args.data_path:
         config["data"]["data_path"] = str(resolve(args.data_path))
     if args.check_config:

@@ -1,0 +1,17 @@
+_base_: b160_supervised_32_40epochs.yaml
+model:
+  model: OST_B_ADALN
+train:
+  steps: 12515
+  save_every: 2503
+evaluation:
+  every: 2503
+initialization:
+  checkpoint: checkpoints/pretraining/priming_b_adaln_uniform_10.pth
+experiment:
+  profile: adaln_timestep_posttraining
+  arm: uniform
+  encoder: supervised
+  epochs: 5
+  pretraining_epochs: 10
+  eval_every_epochs: 1

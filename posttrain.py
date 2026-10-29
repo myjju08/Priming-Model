@@ -82,7 +82,8 @@ def load_config(path):
     from utils.config import load_yaml
     config = load_yaml(resolve(path))
     model, train, matching = config['model'], config['train'], config['matching']
-    if model['model'] not in {'OST_B', 'OST_L'}:
+    ablation = config.get('experiment', {}).get('profile') == 'adaln_timestep_posttraining'
+    if model['model'] not in ({'OST_B_ADALN'} if ablation else {'OST_B', 'OST_L'}):
         raise ValueError('Post-training supports OST_B and OST_L')
     fixed_model = dict(img_size=256, patch_size=16, in_channels=3, label_drop_prob=0.,
         class_tokens=8, guidance_tokens=0, interval_tokens=0, norm_eps=.01, norm_p=1.,
@@ -90,11 +91,21 @@ def load_config(path):
     if any(model.get(key) != value for key, value in fixed_model.items()):
         raise ValueError('Post-training model differs from the B/L production architecture')
     custom = config.get('experiment', {}).get('profile') in {'b160_mae640_32_40epochs','b160_supcon_tuned_32_40epochs','b160_spark_32_40epochs','b160_supervised_32_40epochs'}
-    comparison = config.get('experiment', {}).get('profile') == 'encoder_comparison'
+    comparison = config.get('experiment', {}).get('profile') == 'encoder_comparison' or ablation
     if comparison:
         from utils.experiments import validate_schedule
         validate_schedule(config)
         custom = True
+    if ablation:
+        experiment = config['experiment']
+        if (experiment.get('arm') not in {'fixed', 'uniform'} or
+                (experiment.get('epochs'), experiment.get('eval_every_epochs'),
+                 experiment.get('pretraining_epochs'), experiment.get('encoder')) != (5, 1, 10, 'supervised')):
+            raise ValueError('adaLN comparison requires a declared arm, pretrain10 and posttrain5 with epochwise evaluation')
+        if matching['stack'] != 'convnext_supervised_rn50' or matching['kind'] != 'featurewise_ot':
+            raise ValueError('adaLN comparison requires the existing supervised RN50 featurewise OT objective')
+        if config['evaluation'].get('protocol') != 'drive_fid_is_pr':
+            raise ValueError('adaLN comparison requires the existing Drive evaluation protocol')
     every = config['evaluation']['every']
     expected_train = (train['steps'], 512, 'bf16', 1, every) if comparison else ((100120, 512, 'bf16', 1, 12515) if custom else (25000, 1024, 'bf16', 1, 1250))
     if (train['steps'], train['global_batch_size'], train['dtype'], train['seed'], train['save_every']) != expected_train:
@@ -107,7 +118,7 @@ def load_config(path):
         real_references_per_class=128, epsilon=.001, epsilon_mixture={'0.001':.75, '0.01':.25},
         num_iterations=1000, tolerance=1e-6, seed=7919)
     if custom:
-        if model['model'] != 'OST_B':
+        if model['model'] != ('OST_B_ADALN' if ablation else 'OST_B'):
             raise ValueError('The custom experiment requires B/16')
         fixed_matching.update(samples_per_class=32, real_references_per_class=32)
     if any(matching.get(key) != value for key, value in fixed_matching.items()):
@@ -256,6 +267,8 @@ def prepare_run(config, args, output):
             config['initialization']['checkpoint'] = str(resolve(args.init_checkpoint))
         checkpoint = Path(config['initialization']['checkpoint'])
         source = dict(path=str(checkpoint), bytes=checkpoint.stat().st_size, sha256=sha256(checkpoint))
+        if config['model']['model'] == 'OST_B_ADALN' and not args.init_checkpoint:
+            raise ValueError('adaLN post-training requires --init-checkpoint from its paired pretraining arm')
         if not args.init_checkpoint:
             key = 'priming_'+('b' if config['model']['model'] == 'OST_B' else 'l')+'_160'
             release = json.loads((ROOT/'old/checkpoints/pretraining_manifest.json').read_text())[key]

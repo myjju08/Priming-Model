@@ -25,7 +25,7 @@ def initialize_posttraining(model, path, optimizer_config, *, config):
     if set(state.get('shadows', {})) != {'0.9999'}:
         raise ValueError('Expected one pretraining EMA shadow')
     contract = source.get('contract')
-    if config['model']['model'] == 'OST_B' and not isinstance(contract, dict):
+    if config['model']['model'] in {'OST_B', 'OST_B_ADALN'} and not isinstance(contract, dict):
         raise ValueError('B post-training requires a perceptual pretraining contract')
     if contract is not None:
         for section, keys in (('model', ('model','patch_size','class_tokens','guidance_tokens',
@@ -36,6 +36,19 @@ def initialize_posttraining(model, path, optimizer_config, *, config):
                     raise ValueError(f'Pretraining contract differs: {section}.{key}')
         if contract.get('loss', {}).get('aux', {}).get('enabled') is not True:
             raise ValueError('Post-training requires perceptual pretraining')
+    if config['model']['model'] == 'OST_B_ADALN':
+        from pretrain import validate_adaln_pretraining
+        pretraining_config = source.get('config')
+        if not isinstance(pretraining_config, dict):
+            raise ValueError('adaLN initialization requires the complete pretraining configuration')
+        arm = validate_adaln_pretraining(pretraining_config)
+        if config.get('experiment', {}).get('profile') != 'adaln_timestep_posttraining' or arm != config['experiment'].get('arm'):
+            raise ValueError('adaLN initialization must use its matching pretraining arm')
+        for section in ('model', 'data', 'loss', 'optimizer', 'train'):
+            if contract.get(section) != pretraining_config[section]:
+                raise ValueError(f'adaLN pretraining contract/config disagree: {section}')
+        if step > 12510 or source.get('samples_seen') != step * 1024:
+            raise ValueError('adaLN pretraining exceeds ten epochs or has invalid sample counters')
     expected = model.state_dict()
     shadow = state['shadows']['0.9999']
     if set(shadow) != set(expected):

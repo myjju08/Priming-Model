@@ -317,10 +317,18 @@ class Priming(nn.Module):
         if not 0.0 <= self.t_min <= self.t_max <= 1.0:
             raise ValueError("expected 0 <= t_min <= t_max <= 1")
 
-        if backbone not in OST_models:
-            raise ValueError(f"unknown backbone: {backbone}. available: {list(OST_models.keys())}")
+        self.timestep_conditioned = backbone == "OST_B_ADALN"
+        if self.timestep_conditioned:
+            # Lazy import keeps the released OST model definitions independent
+            # of the experimental module, which reuses OST's image/token path.
+            from .adaln import AdaLNOST
+            constructor = AdaLNOST
+        elif backbone in OST_models:
+            constructor = OST_models[backbone]
+        else:
+            raise ValueError(f"unknown backbone: {backbone}. available: {[*OST_models, 'OST_B_ADALN']}")
 
-        self.net = OST_models[backbone](
+        self.net = constructor(
             input_size=self.input_size,
             patch_size=patch_size,
             in_channels=in_channels,
@@ -377,6 +385,11 @@ class Priming(nn.Module):
     def sample_t(self, n, device, dtype):
         if self.t_dist == "uniform":
             shape = (n, 1, 1, 1)
+            if self.timestep_conditioned:
+                # Both ablation arms consume the same RNG draw, including the
+                # fixed-t arm. Their subsequent Gaussian/crop streams agree.
+                uniform = torch.rand(shape, device=device, dtype=dtype)
+                return uniform * (self.t_max - self.t_min) + self.t_min
             if self.t_min == self.t_max:
                 return torch.full(shape, self.t_min, device=device, dtype=dtype)
             return torch.empty(shape, device=device, dtype=dtype).uniform_(self.t_min, self.t_max)
@@ -445,6 +458,9 @@ class Priming(nn.Module):
     def _forward_generator(self, z, y, cfg=1.0, t_min=0.0, t_max=1.0):
         if self.label_drop_prob >= 1.0:
             y = torch.full_like(y, self.num_classes)
+        if self.timestep_conditioned:
+            # The one-step post-training/inference endpoint is pure noise.
+            return self.net(z, y, t=torch.ones(z.shape[0], device=z.device, dtype=z.dtype))
         return self.net(
             z,
             y,
@@ -506,7 +522,7 @@ class Priming(nn.Module):
             x_pred = self.net(z_t, labels, omega=omega, t_min=t_min, t_max=t_max)
         else:
             x_target = x
-            x_pred = self.net(z_t, labels)
+            x_pred = self.net(z_t, labels, t=t) if self.timestep_conditioned else self.net(z_t, labels)
 
         return reconstruction_loss(
             x_pred, x_target, norm_eps=self.norm_eps, norm_p=self.norm_p,
