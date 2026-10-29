@@ -167,6 +167,7 @@ class DiffusionPretrainTests(unittest.TestCase):
                 return x*self.scale + noise_t[:, None, None, None]
 
         model = nn.Module()
+        model.timestep_conditioning = True
         model.net = Net()
         ema = EMA(model, decay=.9999, batch_size=1024)
         model.train()

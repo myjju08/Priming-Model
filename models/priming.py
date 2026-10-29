@@ -321,6 +321,7 @@ class Priming(nn.Module):
         corruption="denoising",
         timestep_conditioning=False,
         generation_t=1.0,
+        log_noise_metrics=False,
     ):
         super().__init__()
         self.img_size = img_size
@@ -343,6 +344,9 @@ class Priming(nn.Module):
         self.perceptual_threshold = perceptual_threshold
         self.timestep_conditioning = timestep_conditioning
         self.generation_t = float(generation_t)
+        if not isinstance(log_noise_metrics, bool):
+            raise ValueError("log_noise_metrics must be a boolean")
+        self.log_noise_metrics = log_noise_metrics
         self.input_space = input_space or (
             "pixel" if tokenizer_patch_size == 1 and in_channels == 3 else "latent"
         )
@@ -562,7 +566,7 @@ class Priming(nn.Module):
             aux_loss_fn=aux_loss_fn if self.training else None, aux_target=x,
             times=t, perceptual_threshold=self.perceptual_threshold,
         )
-        if self.timestep_conditioning:
+        if self.timestep_conditioning or self.log_noise_metrics:
             metrics["noise_t_mean"] = t.mean()
             if self.training and aux_loss_fn is not None:
                 metrics["perceptual_active_fraction"] = (t <= self.perceptual_threshold).float().mean()

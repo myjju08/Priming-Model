@@ -84,6 +84,8 @@ def load_config(path):
     model, train, matching = config['model'], config['train'], config['matching']
     if model['model'] not in {'OST_B', 'OST_L'}:
         raise ValueError('Post-training supports OST_B and OST_L')
+    if 'conditioning_mode' in model:
+        raise ValueError('conditioning_mode is unsupported: original Priming has no adaLN architecture switch')
     fixed_model = dict(img_size=256, patch_size=16, in_channels=3, label_drop_prob=0.,
         class_tokens=8, guidance_tokens=0, interval_tokens=0, norm_eps=.01, norm_p=1.,
         rope_2d=True, learned_pe=True, P_mean=.8, P_std=.8, perceptual_threshold=.8)

@@ -151,11 +151,15 @@ def resolved_post_configs(plan):
     from posttrain import load_config
     config = load_config(plan["posttraining"]["config"])
     if (config["train"]["steps"] != 100120 or config["matching"]["stack"] != "convnext_supervised_rn50"
-            or config["model"].get("timestep_conditioning") is not True
             or config["model"].get("generation_t") != 1.
             or config["sampling"]["num_steps"] != 1
             or config["initialization"]["checkpoint"] != str(initialization_checkpoint(plan))):
-        raise ValueError("Post-training must use the complete diffusion checkpoint, supervised RN50 and fixed-t=1 one-step generation")
+        raise ValueError("Post-training must use the complete diffusion checkpoint, supervised RN50 and pure-noise one-step generation")
+    pretraining, _ = resolved_configs(plan)
+    before, after = pretraining["model"], config["model"]
+    if (before.get("timestep_conditioning", False) is not after.get("timestep_conditioning", False)
+            or any(before[key] != after[key] for key in ("class_tokens", "guidance_tokens", "interval_tokens"))):
+        raise ValueError("Pretraining and post-training timestep-conditioning architecture or prefix tokens differ")
     tracking = config.get("tracking", {})
     if (tracking.get("project"), tracking.get("entity")) != (plan["wandb_project"], plan["wandb_entity"]):
         raise ValueError("Post-training W&B project/entity differs from the authorized project")

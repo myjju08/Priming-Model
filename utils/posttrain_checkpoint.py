@@ -18,6 +18,8 @@ def validate_timestep_contract(source, config):
     if not isinstance(contract, dict) or not isinstance(contract.get('model', {}), dict):
         raise ValueError('Invalid pretraining model contract')
     source_model = contract.get('model', {})
+    if 'conditioning_mode' in source_model or 'conditioning_mode' in config['model']:
+        raise ValueError('conditioning_mode is unsupported: adaLN architecture contracts cannot be mixed')
     expected = config['model'].get('timestep_conditioning', False)
     actual = source_model.get('timestep_conditioning', False)
     if not isinstance(expected, bool) or not isinstance(actual, bool):
@@ -38,6 +40,8 @@ def validate_timestep_contract(source, config):
         has_timestep_weights = any(name.startswith('net.noise_t_embedder.') for name in tensors)
         if has_timestep_weights != actual:
             raise ValueError(f'Pretraining {label} timestep tensors disagree with its architecture contract')
+        if any('.adaLN_modulation.' in name for name in tensors):
+            raise ValueError(f'Pretraining {label} contains undeclared adaLN tensors')
 
 
 def validate_diffusion_pretraining_contract(source):
@@ -61,18 +65,24 @@ def validate_diffusion_pretraining_contract(source):
     required = dict(prediction_target='x0', noise_schedule='linear', loss_weighting='uniform')
     if any(experiment.get(key) != value for key, value in required.items()):
         raise ValueError('Diffusion initialization requires linear-path x0 prediction with uniform loss weighting')
+    conditioning = experiment.get('conditioning', 'timestep')
+    if not isinstance(conditioning, str) or conditioning not in {'timestep', 'none'}:
+        raise ValueError('Diffusion conditioning must be timestep or explicitly none')
+    time_conditioned = conditioning == 'timestep'
     for section in ('model', 'data', 'loss', 'train', 'optimizer'):
         if not isinstance(contract.get(section), dict) or contract[section] != saved_config.get(section):
             raise ValueError(f'Diffusion checkpoint config and contract differ: {section}')
     model, data, loss, train = (contract[key] for key in ('model', 'data', 'loss', 'train'))
+    if 'conditioning_mode' in model:
+        raise ValueError('conditioning_mode is unsupported: diffusion initialization requires original Priming')
     fixed_model = dict(model='OST_B', patch_size=16, token_channels=3, tokenizer_patch_size=1,
                        class_tokens=8, guidance_tokens=0, interval_tokens=0, label_drop_prob=0.,
                        corruption='denoising', t_dist='uniform', noise_scale=1., rope_2d=True,
-                       learned_pe=True, timestep_conditioning=True, generation_t=1.)
+                       learned_pe=True, timestep_conditioning=time_conditioned, generation_t=1.)
     if (any(model.get(key) != value for key, value in fixed_model.items())
-            or model.get('timestep_conditioning') is not True
+            or model.get('timestep_conditioning') is not time_conditioned
             or isinstance(model.get('generation_t'), bool)):
-        raise ValueError('Diffusion initialization requires the time-conditioned B/16 pixel architecture')
+        raise ValueError('Diffusion initialization requires B/16 with its declared timestep-conditioning architecture')
     intervals = {'variable_noise': (0., 1.), 'fixed_noise_control': (.8, .8)}
     if (experiment.get('variant') not in intervals
             or (model.get('t_min'), model.get('t_max')) != intervals[experiment['variant']]):
@@ -131,9 +141,10 @@ def initialize_posttraining(model, path, optimizer_config, *, config):
     if diffusion:
         if optimizer_config.get('optimizer') != 'adamw':
             raise ValueError('Diffusion post-training starts a fresh AdamW optimizer')
-        if (getattr(model, 'timestep_conditioning', False) is not True
+        expected_conditioning = contract['model']['timestep_conditioning']
+        if (getattr(model, 'timestep_conditioning', False) is not expected_conditioning
                 or getattr(model, 'generation_t', None) != 1.
-                or getattr(getattr(model, 'net', None), 'timestep_conditioning', False) is not True
+                or getattr(getattr(model, 'net', None), 'timestep_conditioning', False) is not expected_conditioning
                 or getattr(model.net, 'generation_t', None) != 1.
                 or any(not parameter.requires_grad for parameter in model.parameters())):
             raise ValueError('Diffusion post-training retains all trainable parameters and generation_t=1')

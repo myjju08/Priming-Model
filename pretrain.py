@@ -26,6 +26,10 @@ def load_config(path):
     if diffusion and (not isinstance(experiment, dict) or
                       experiment.get("profile") != "diffusion_pretraining"):
         raise ValueError("Unknown pretraining experiment profile")
+    if "conditioning_mode" in model:
+        raise ValueError("conditioning_mode is unsupported: original Priming has no adaLN architecture switch")
+    if "log_noise_metrics" in model and not isinstance(model["log_noise_metrics"], bool):
+        raise ValueError("log_noise_metrics must be boolean")
     batches = {(64, 2)}
     if diffusion and config["loss"]["aux"]["enabled"] is True:
         batches.add((32, 4))
@@ -38,6 +42,10 @@ def load_config(path):
         objective = dict(prediction_target="x0", noise_schedule="linear", loss_weighting="uniform")
         if any(experiment.get(key) != value for key, value in objective.items()):
             raise ValueError("Supported diffusion objective is linear-path x0 prediction with w(t)=1")
+        conditioning = experiment.get("conditioning", "timestep")
+        if not isinstance(conditioning, str) or conditioning not in {"timestep", "none"}:
+            raise ValueError("Diffusion conditioning must be timestep or explicitly none")
+        time_conditioned = conditioning == "timestep"
         variant = experiment.get("variant")
         intervals = {"variable_noise": (0., 1.), "fixed_noise_control": (.8, .8)}
         if variant not in intervals or (model["t_min"], model["t_max"]) != intervals[variant]:
@@ -46,11 +54,11 @@ def load_config(path):
                         tokenizer_patch_size=1, class_tokens=8, guidance_tokens=0,
                         interval_tokens=0, label_drop_prob=0., corruption="denoising",
                         t_dist="uniform", noise_scale=1., rope_2d=True, learned_pe=True,
-                        timestep_conditioning=True, generation_t=1.)
+                        timestep_conditioning=time_conditioned, generation_t=1.)
         if any(model.get(key) != value for key, value in expected.items()):
-            raise ValueError("Diffusion comparison requires time-conditioned B/16 and generation_t=1")
-        if model["timestep_conditioning"] is not True or isinstance(model["generation_t"], bool):
-            raise ValueError("Time conditioning must be boolean true and generation_t must be numeric")
+            raise ValueError("Diffusion comparison requires B/16 with the declared timestep conditioning and generation_t=1")
+        if model["timestep_conditioning"] is not time_conditioned or isinstance(model["generation_t"], bool):
+            raise ValueError("Time conditioning must be a matching boolean and generation_t must be numeric")
         if model.get("input_space") not in (None, "pixel") or (
                 config["data"]["img_size"], config["data"]["num_classes"]) != (256, 1000):
             raise ValueError("Diffusion comparison requires ImageNet RGB256")
@@ -432,6 +440,7 @@ def main():
             model = make_model(config, device="meta")
         print(json.dumps(dict(model=config["model"]["model"], depth=len(model.net.blocks),
                               parameters=sum(p.numel() for p in model.parameters()),
+                              timestep_conditioning=config["model"].get("timestep_conditioning", False),
                               updates=config["train"]["epochs"] * config["train"]["steps_per_epoch"],
                               perceptual=config["loss"]["aux"]["enabled"]), indent=2))
         return 0
